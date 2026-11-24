@@ -1,0 +1,22 @@
+{
+  "name": "ledgerly",
+  "displayName": "Ledgerly",
+  "version": "0.1.0",
+  "description": "Run client onboarding, orders and inventory, invoicing and payments, and the double-entry books for a B2B company from a conversation with Claude.",
+  "author": {
+    "name": "PJ Braga"
+  },
+  "license": "MIT",
+  "keywords": [
+    "accounting",
+    "invoicing",
+    "inventory",
+    "b2b",
+    "bookkeeping",
+    "onboarding"
+  ],
+  "repository": "https://github.com/braga-ctrl/ledgerly",
+  "icon": "assets/icon.png",
+  "privacyPolicyUrl": "https://ledgerly.REPLACE-SUBDOMAIN.workers.dev/privacy",
+  "homepage": "https://github.com/braga-ctrl/ledgerly"
+}

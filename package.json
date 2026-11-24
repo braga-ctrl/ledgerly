@@ -1,0 +1,23 @@
+{
+  "name": "ledgerly",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-tenant B2B accounting app: client onboarding, orders & inventory, invoicing & payments, double-entry ledger. Ships with a remote MCP server.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply ledgerly-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply ledgerly-db --remote",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261123.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ledgerly": {
+      "type": "http",
+      "url": "https://ledgerly.REPLACE-SUBDOMAIN.workers.dev/mcp"
+    }
+  }
+}

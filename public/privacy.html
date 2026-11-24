@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledgerly privacy policy</title>
+<style>
+  :root { --bg:#f5f4ef; --ink:#1d2126; --muted:#69707a; --line:#e3e0d8; --accent:#0e6b5c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171a; --ink:#e8eaed; --muted:#9aa1ab; --line:#2c3238; --accent:#3fb59f; } }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:36px 20px 80px; }
+  h1 { font-size:26px; letter-spacing:-.01em; margin:0 0 4px; }
+  h2 { font-size:18px; margin:30px 0 6px; }
+  p, li { color:var(--ink); } .muted { color:var(--muted); }
+  a { color:var(--accent); } li { margin:4px 0; }
+  .note { border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:18px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ledgerly privacy policy</h1>
+  <p class="muted">Last updated: 24 November 2026</p>
+
+  <div class="note"><b>Operator note:</b> this page ships as a starting template that describes what the software actually does. Have it reviewed against the laws that apply to you and your customers, and set the contact address with <code>node scripts/configure.mjs --contact you@example.com</code>.</div>
+
+  <h2>Who we are</h2>
+  <p>Ledgerly is an accounting service for businesses. Questions about this policy or your data: <a href="mailto:franzpeterjosephbraga@gmail.com"><!--contact-->franzpeterjosephbraga@gmail.com<!--/contact--></a>.</p>
+
+  <h2>What we store</h2>
+  <p>When a company uses Ledgerly, it records business data in its own workspace: client names and email addresses, onboarding document statuses and reviewer notes (not the documents themselves), product and price lists, stock levels, orders, invoices, payments, expenses and journal entries.</p>
+  <p>For sign-in we store a one-way hash of each workspace API key, and hashes of OAuth tokens issued to connected apps such as Claude, with the name and redirect address the app registered. We never store your API key or tokens in readable form.</p>
+
+  <h2>How it is used</h2>
+  <p>Workspace data is used only to run the service for that workspace: to show it to its users, to answer requests that its connected apps make on its behalf, and to produce its reports. Each workspace can read only its own data. We do not sell data, use it for advertising, or use it to train models.</p>
+
+  <h2>Connected apps (Claude)</h2>
+  <p>When you connect Claude to Ledgerly, Claude can read and change the data in your workspace, and the content of those requests and responses passes through Claude as part of your conversation. Claude receives a short-lived access token, never your workspace key. Your workspace administrator can revoke access at any time by rotating the workspace key, which immediately signs out every connected app and invalidates all previous keys.</p>
+
+  <h2>Where it is kept and who processes it</h2>
+  <p>Data is stored in a Cloudflare D1 database and served by Cloudflare Workers. Cloudflare acts as our infrastructure processor. We share data with no one else unless the law requires it.</p>
+
+  <h2>Retention and deletion</h2>
+  <p>Business records are kept for as long as the workspace exists, because accounting records need a history. Expired sign-in codes and tokens are deleted automatically. To delete a workspace and its data, email the address above from the workspace owner's address.</p>
+
+  <h2>Security</h2>
+  <p>Traffic is encrypted in transit. Sign-in uses OAuth 2.0 with PKCE, authorization codes are single-use, and refresh tokens are rotated on every use. No system is perfectly secure; tell us promptly if you suspect a problem.</p>
+
+  <h2>Changes</h2>
+  <p>If this policy changes in a way that matters, we will update the date above.</p>
+</main>
+</body>
+</html>

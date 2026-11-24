@@ -1,0 +1,14 @@
+{
+  "name": "ledgerly-marketplace",
+  "description": "Ledgerly: client onboarding, orders and inventory, invoicing and double-entry accounting for Claude.",
+  "owner": {
+    "name": "PJ Braga"
+  },
+  "plugins": [
+    {
+      "name": "ledgerly",
+      "source": "./plugin",
+      "description": "Run client onboarding, orders and inventory, invoicing and payments, and the double-entry books for a B2B company from a conversation with Claude."
+    }
+  ]
+}

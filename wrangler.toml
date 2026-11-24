@@ -1,0 +1,22 @@
+name = "ledgerly"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# The web app (public/index.html) is served as static assets; /api, /mcp and /admin run in the Worker.
+[assets]
+directory = "./public"
+
+[vars]
+CURRENCY = "USD"
+REQUIRED_CLIENT_DOCS = "business_registration,tax_id,authorized_signatory"
+
+# Create the database once with:  npx wrangler d1 create ledgerly-db
+# then paste the printed database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "ledgerly-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Secret (set with `npx wrangler secret put ADMIN_TOKEN`):
+#   ADMIN_TOKEN - protects POST /admin/orgs, which creates a company workspace and its first API key.
