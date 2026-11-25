@@ -2,7 +2,7 @@
   "mcpServers": {
     "ledgerly": {
       "type": "http",
-      "url": "https://ledgerly.REPLACE-SUBDOMAIN.workers.dev/mcp"
+      "url": "https://ledgerly.franzpeterjosephbraga.workers.dev/mcp"
     }
   }
 }

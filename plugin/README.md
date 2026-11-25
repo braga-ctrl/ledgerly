@@ -25,7 +25,7 @@ Three skills ship with the plugin and teach Claude the right order of steps: `on
 
 ## Data
 
-Everything you ask Claude to record or look up is sent to the Ledgerly server at <!--host-->ledgerly.example.workers.dev<!--/host--> and stored in that server's database: client names and emails, product and price lists, orders, invoices, payments and journal entries. The plugin itself stores nothing and sends data nowhere else. Sign-in uses OAuth 2.0 with PKCE; Claude receives a short-lived access token, never your workspace key.
+Everything you ask Claude to record or look up is sent to the Ledgerly server at <!--host-->ledgerly.franzpeterjosephbraga.workers.dev<!--/host--> and stored in that server's database: client names and emails, product and price lists, orders, invoices, payments and journal entries. The plugin itself stores nothing and sends data nowhere else. Sign-in uses OAuth 2.0 with PKCE; Claude receives a short-lived access token, never your workspace key.
 
 ## License
 

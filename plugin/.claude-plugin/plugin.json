@@ -17,6 +17,6 @@
   ],
   "repository": "https://github.com/braga-ctrl/ledgerly",
   "icon": "assets/icon.png",
-  "privacyPolicyUrl": "https://ledgerly.REPLACE-SUBDOMAIN.workers.dev/privacy",
+  "privacyPolicyUrl": "https://ledgerly.franzpeterjosephbraga.workers.dev/privacy",
   "homepage": "https://github.com/braga-ctrl/ledgerly"
 }
