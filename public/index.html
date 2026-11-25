@@ -53,6 +53,9 @@
   .tag.under_review, .tag.partial, .tag.confirmed, .tag.received { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
   .tag.documents_pending, .tag.requested, .tag.overdue { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
   .tag.void, .tag.cancelled { color: var(--muted); }
+  .tag.credited { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+  .banner { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); border-radius: 12px; padding: 10px 14px; margin: 0 0 10px; font-size: 14px; }
+  .banner b { color: var(--warn); }
   .empty { padding: 26px; text-align: center; color: var(--muted); }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -117,10 +120,12 @@ function h(tag, props, ...kids) {
 const $ = (s) => document.querySelector(s);
 const fmt = (n) => new Intl.NumberFormat(undefined, { style: "currency", currency }).format(n || 0);
 const tag = (s) => h("span", { class: "tag " + s }, String(s).replace(/_/g, " "));
-function toast(msg) {
+function toast(msg, ms) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("on");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("on"), 2600);
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("on"), ms || 2600);
 }
+// A saved action can still come back with warnings (for example cash went negative): never hide them.
+const saved = (res, msg) => (res && res.warnings && res.warnings.length ? toast("Saved, but: " + res.warnings.join(" "), 9000) : toast(msg));
 
 async function call(name, args) {
   const res = await fetch("/api/tools/" + name, {
@@ -187,7 +192,7 @@ function openForm(toolName, title, hint) {
         else args[name] = v;
       }
     } catch (ex) { err.textContent = "Could not read the form: " + ex.message; return; }
-    try { await call(toolName, args); closeDialog(); toast("Saved"); render(); }
+    try { const res = await call(toolName, args); closeDialog(); saved(res, "Saved"); render(); }
     catch (ex) { if (ex.message !== "auth") err.textContent = ex.message; }
   });
   openDialog(h("h2", {}, title || t.title), h("p", { class: "hint" }, hint || t.description), form);
@@ -198,10 +203,12 @@ const views = {
   async dashboard(root) {
     const [d, aging] = await Promise.all([call("get_dashboard"), call("get_ar_aging")]);
     const k = (l, v, s, warn) => h("div", { class: "kpi" + (warn ? " warn" : "") }, h("div", { class: "l" }, l), h("div", { class: "v" }, v), s ? h("div", { class: "s" }, s) : null);
+    const waiting = (b) => b.doc_type.replace(/_/g, " ") + (b.waiting_on === "reviewer" ? " (to review)" : " (from client)");
     root.append(
       h("h2", {}, "Dashboard"),
+      ...(d.warnings || []).map((w) => h("div", { class: "banner" }, h("b", {}, "Needs attention: "), w)),
       h("div", { class: "kpis" },
-        k("Cash", fmt(d.cash)),
+        k("Cash", fmt(d.cash), d.cash < 0 ? "negative: see warning above" : null, d.cash < 0),
         k("Receivables", fmt(d.accounts_receivable), d.open_invoices.count + " open invoice" + (d.open_invoices.count === 1 ? "" : "s")),
         k("Overdue", fmt(d.overdue_invoices.amount), d.overdue_invoices.count + " invoice" + (d.overdue_invoices.count === 1 ? "" : "s"), d.overdue_invoices.count > 0),
         k("Payables", fmt(d.accounts_payable)),
@@ -214,6 +221,11 @@ const views = {
       h("div", { class: "row" }, Object.keys(d.clients_by_status).length
         ? Object.entries(d.clients_by_status).map(([s, n]) => h("span", {}, tag(s), " ", n, "  "))
         : h("span", { class: "muted" }, "No clients yet.")),
+      ...(d.onboarding_attention.length ? [h("div", { style: "margin-top:10px" }, table([
+        { h: "Waiting to be approved", f: (r) => r.client },
+        { h: "Days", num: 1, f: (r) => r.days_pending },
+        { h: "Blocking", f: (r) => r.blocking_documents.map(waiting).join(", ") },
+      ], d.onboarding_attention, (r) => clientDetail(r.client_id)))] : []),
       h("h3", {}, "Receivables aging"),
       table([
         { h: "Client", f: (r) => r.client },
@@ -234,7 +246,9 @@ const views = {
         { h: "Name", f: (r) => r.name },
         { h: "Email", f: (r) => r.email || "" },
         { h: "Status", f: (r) => tag(r.status) },
-        { h: "Docs outstanding", num: 1, f: (r) => r.documents_outstanding },
+        { h: "Days pending", num: 1, f: (r) => (r.days_pending === null ? "" : r.days_pending) },
+        { h: "Blocking approval", f: (r) => r.blocking_documents.map((b) => b.doc_type.replace(/_/g, " ") + (b.waiting_on === "reviewer" ? " (to review)" : "")).join(", ") },
+        { h: "Credit held", num: 1, f: (r) => (r.credit_balance ? fmt(r.credit_balance) : "") },
       ], clients, (r) => clientDetail(r.id)));
   },
 
@@ -249,6 +263,7 @@ const views = {
         { h: "SKU", f: (r) => r.sku },
         { h: "Product", f: (r) => r.name },
         { h: "On hand", num: 1, f: (r) => r.stock_qty },
+        { h: "Reorder at", num: 1, f: (r) => r.reorder_level },
         { h: "Price", num: 1, f: (r) => fmt(r.unit_price) },
         { h: "Avg cost", num: 1, f: (r) => fmt(r.unit_cost) },
         { h: "Stock value", num: 1, f: (r) => fmt(r.stock_value) },
@@ -312,7 +327,7 @@ const views = {
 };
 
 async function act(name, args, msg) {
-  try { await call(name, args); toast(msg); closeDialog(); render(); } catch (e) { if (e.message !== "auth") toast(e.message); }
+  try { const res = await call(name, args); saved(res, msg); closeDialog(); render(); } catch (e) { if (e.message !== "auth") toast(e.message, 6000); }
 }
 
 async function clientDetail(id) {
@@ -344,18 +359,48 @@ async function invoiceDetail(number) {
       i.items.map((x) => h("tr", {}, h("td", {}, x.description), h("td", { class: "num" }, x.qty + " × " + fmt(x.unit_price)), h("td", { class: "num" }, fmt(x.line_total)))),
       h("tr", {}, h("td", {}, h("b", {}, "Total")), h("td", {}), h("td", { class: "num" }, h("b", {}, fmt(i.total)))),
       h("tr", {}, h("td", {}, "Paid"), h("td", {}), h("td", { class: "num" }, fmt(i.paid))),
+      i.credited ? h("tr", {}, h("td", {}, "Credited"), h("td", {}), h("td", { class: "num" }, fmt(i.credited))) : null,
       h("tr", {}, h("td", {}, h("b", {}, "Balance")), h("td", {}), h("td", { class: "num" }, h("b", {}, fmt(i.balance))))))),
+    i.credit_notes.length ? [h("h3", {}, "Credit notes"), h("div", { class: "card" }, h("table", {}, h("tbody", {},
+      i.credit_notes.map((n) => h("tr", {}, h("td", {}, n.number), h("td", {}, n.date), h("td", { class: "muted" }, n.reason), h("td", { class: "num" }, fmt(n.total))))))) ] : null,
     i.payments.length ? [h("h3", {}, "Payments"), h("div", { class: "card" }, h("table", {}, h("tbody", {},
       i.payments.map((p) => h("tr", {}, h("td", {}, p.date), h("td", {}, p.method || ""), h("td", { class: "num" }, fmt(p.amount))))))) ] : null,
     canPay ? [h("h3", {}, "Record payment"), h("div", { class: "grid2" }, h("label", {}, h("span", { class: "lbl" }, "amount"), amount), h("label", {}, h("span", { class: "lbl" }, "method"), method)), err] : null,
     h("div", { class: "actions" },
-      i.status === "open" && !i.order_id ? h("button", { class: "btn danger", onclick: () => act("void_invoice", { invoice: i.number }, "Invoice voided") }, "Void") : null,
+      i.status === "open" && !i.order_id && !i.credited ? h("button", { class: "btn danger", onclick: () => act("void_invoice", { invoice: i.number }, "Invoice voided") }, "Void") : null,
+      i.status !== "void" && i.items.some((x) => x.qty > x.credited_qty) ? h("button", { class: "btn", onclick: () => creditNoteDialog(i) }, "Credit note") : null,
       h("button", { class: "btn", onclick: closeDialog }, "Close"),
       canPay ? h("button", { class: "btn primary", onclick: async () => {
         err.textContent = "";
         try { await call("record_payment", { invoice: i.number, amount: Number(amount.value), method: method.value || undefined }); toast("Payment recorded"); render(); await invoiceDetail(number); }
         catch (e) { if (e.message !== "auth") err.textContent = e.message; }
       } }, "Record payment") : null));
+}
+
+// A credit note corrects an invoice that is already shipped or paid. Quantities start at "everything not yet credited".
+function creditNoteDialog(i) {
+  const left = i.items.map((x) => x.qty - x.credited_qty);
+  const qtys = i.items.map((x, n) => h("input", { type: "number", min: "0", max: String(left[n]), step: "1", value: String(left[n]), disabled: left[n] === 0 }));
+  const reason = h("input", { type: "text", placeholder: "e.g. damaged in transit" });
+  const back = h("input", { type: "checkbox" });
+  const err = h("p", { class: "err" });
+  openDialog(
+    h("h2", {}, "Credit note for " + i.number),
+    h("p", { class: "hint" }, "Set how many units to credit on each line. This cannot be undone. If the client has already paid, the excess is kept as a credit for them."),
+    h("div", { class: "card" }, h("table", {}, h("tbody", {}, i.items.map((x, n) =>
+      h("tr", {}, h("td", {}, x.description), h("td", { class: "num" }, left[n] + " of " + x.qty + " left"), h("td", {}, qtys[n]))))),),
+    h("label", {}, h("span", { class: "lbl" }, "reason *"), reason),
+    h("label", {}, h("span", { class: "lbl" }, "goods came back into stock (tick if they were returned)"), back),
+    err,
+    h("div", { class: "actions" },
+      h("button", { type: "button", class: "btn", onclick: closeDialog }, "Cancel"),
+      h("button", { type: "button", class: "btn primary", onclick: async () => {
+        err.textContent = "";
+        const items = qtys.map((q, n) => ({ line: n + 1, qty: Number(q.value) })).filter((x) => x.qty > 0);
+        if (!items.length) { err.textContent = "Enter a quantity on at least one line."; return; }
+        try { const res = await call("issue_credit_note", { invoice: i.number, reason: reason.value, items, return_stock: back.checked }); saved(res, "Credit note " + res.number + " issued"); render(); await invoiceDetail(i.number); }
+        catch (e) { if (e.message !== "auth") err.textContent = e.message; }
+      } }, "Issue credit note")));
 }
 
 // ---------- shell ----------

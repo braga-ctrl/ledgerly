@@ -8,6 +8,8 @@ Ledgerly lets Claude run the back office of a business that sells to other busin
 - **Sell and invoice.** Create an order for an approved client, check stock before promising it, ship it, and get the invoice in one step. Record full or partial payments as money arrives.
 - **Manage inventory.** Add products, receive stock from suppliers (cost is averaged for you), and see what is running low.
 - **Keep the books.** Every sale, payment, purchase and expense posts a balanced journal entry. Ask for the trial balance, profit and loss, receivables aging, or the raw journal.
+- **Correct mistakes without rewriting history.** Issue a credit note against a shipped or paid invoice (with or without the goods coming back), or reverse a journal entry with a recorded reason. Nothing posted is ever edited, and product, client and setting edits are kept in an audit log.
+- **Stay ahead of problems.** The dashboard warns when cash goes negative, shows how long each client has been waiting for approval and which documents are holding them up, and flags products with no reorder level. A cash policy (block, warn or allow) decides what happens when a payment would overdraw cash.
 
 Three skills ship with the plugin and teach Claude the right order of steps: `onboard-client`, `order-to-cash` and `month-end-review`.
 

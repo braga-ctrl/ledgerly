@@ -7,7 +7,9 @@ Use the Ledgerly connector. Report only what the data returns; do not estimate o
 
 ## Quick health check
 
-Call `get_dashboard` and summarize in a few lines: cash, receivables, overdue amount, payables, this month's revenue, expenses and net income, plus anything needing attention (overdue invoices, low stock, orders waiting to ship, clients stuck in onboarding).
+Call `get_dashboard` and summarize in a few lines: cash, receivables, overdue amount, payables, this month's revenue, expenses and net income, plus anything needing attention (overdue invoices, low stock, orders waiting to ship, clients stuck in onboarding and what is blocking them, credit held for clients).
+
+Always report everything in the dashboard's `warnings` list first, in plain words. Negative cash is the one to take seriously: it usually means stock or expenses were paid in cash that was never put into the business. Offer to record owner funding (`record_owner_investment`) only if the user confirms the money really went in. Do not record it on your own.
 
 ## Month-end close
 
@@ -17,7 +19,12 @@ Work through these in order and stop to tell the user if any check fails:
 2. `get_profit_and_loss` with `from` and `to` for the month: revenue, cost of goods sold, gross profit, expenses, net income.
 3. `get_ar_aging`: list clients with balances past 30 days, largest first.
 4. `get_low_stock`: list products at or below their reorder level.
-5. `get_journal` if the user wants to audit something specific.
+5. `get_journal` if the user wants to audit something specific. Entries carry ids; an entry that was reversed shows `reversed_by`, and a reversing entry shows what it reverses and why.
+6. `get_audit_log` to see who changed what: product and client edits, setting changes, reversals and credit notes.
+
+## Correcting the books
+
+Posted entries are never edited. To fix a wrong entry (an expense, owner investment or supplier payment), use `reverse_journal_entry` with its id and a real reason, then post the correct entry. Say plainly what will be reversed and get a yes first. Entries that belong to an invoice, payment, stock receipt or shipped order are refused: for an invoice use `issue_credit_note` (see the order-to-cash skill) or `void_invoice`.
 
 ## Chasing late payers
 
@@ -27,4 +34,4 @@ For each overdue invoice, offer to draft a short, polite reminder with the invoi
 
 - Ledgerly records transactions; it does not file taxes or give tax or legal advice. If asked, say so and suggest an accountant.
 - The profit and loss defaults to the current month. If the user says "last month" or "this quarter", pass explicit dates.
-- Voided invoices and fully paid invoices do not appear in aging.
+- Voided invoices, fully paid invoices and invoices settled by credit notes do not appear in aging, and credit notes reduce what an invoice still owes.

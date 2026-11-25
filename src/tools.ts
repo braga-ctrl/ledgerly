@@ -30,7 +30,7 @@ export const tools: Tool[] = [
     name: "get_dashboard",
     title: "Business dashboard",
     description:
-      "Snapshot of the business: cash, receivables, payables, inventory value, open and overdue invoices, this month's revenue/expenses/net income, low-stock count, orders awaiting fulfilment, and clients by onboarding status. Start here for 'how are we doing?'.",
+      "Snapshot of the business: cash, receivables, payables, client credits, inventory value, open and overdue invoices, this month's revenue/expenses/net income, low-stock count, orders awaiting fulfilment, clients by onboarding status (with how long each unapproved client has waited and which documents block them), and a list of warnings such as negative cash. Start here for 'how are we doing?', and always mention any warnings.",
     inputSchema: obj({}),
     readOnly: true,
     run: (c) => svc.dashboard(c),
@@ -49,7 +49,8 @@ export const tools: Tool[] = [
   {
     name: "list_clients",
     title: "List clients",
-    description: "List clients with their onboarding status and how many documents are still outstanding.",
+    description:
+      "List clients with their onboarding status, how many days each unapproved client has been waiting, which documents are blocking approval (and whether the client or a reviewer is the one to act), and any credit held for the client.",
     inputSchema: obj({ status: str("Filter by status", { enum: ["documents_pending", "under_review", "approved"] }) }),
     readOnly: true,
     run: svc.listClients,
@@ -79,24 +80,49 @@ export const tools: Tool[] = [
     readOnly: false,
     run: svc.updateClientDocument,
   },
+  {
+    name: "update_client",
+    title: "Edit client details",
+    description:
+      "Change a client's name or contact email. Onboarding status cannot be edited here (it follows the documents). Every change is written to the audit log. Pass an empty email to clear it.",
+    inputSchema: obj(
+      { client: str("Client id or exact client name"), name: str("New name"), email: str("New contact email (empty string clears it)") },
+      ["client"],
+    ),
+    readOnly: false,
+    run: svc.updateClient,
+  },
 
   // ---- inventory ---------------------------------------------------------
   {
     name: "add_product",
     title: "Add product",
-    description: "Create a product in the catalogue. Stock starts at zero: use receive_stock to bring inventory in.",
+    description:
+      "Create a product in the catalogue. Stock starts at zero: use receive_stock to bring inventory in. Ask the user for the reorder level before calling: it is the stock level at which they want a low-stock warning (0 only warns once the product is already out of stock).",
     inputSchema: obj(
       {
         sku: str("Unique stock keeping unit code"),
         name: str("Product name"),
         unit_price: num("Selling price per unit"),
+        reorder_level: int("Flag as low stock when on-hand quantity is at or below this number. 0 means only flag it once it is out of stock."),
         unit_cost: num("Initial cost per unit (optional; receive_stock keeps a weighted average)"),
-        reorder_level: int("Flag as low stock when on-hand quantity is at or below this number"),
       },
-      ["sku", "name", "unit_price"],
+      ["sku", "name", "unit_price", "reorder_level"],
     ),
     readOnly: false,
     run: svc.addProduct,
+  },
+  {
+    name: "update_product",
+    title: "Edit product",
+    description:
+      "Change a product's name, selling price or reorder level. Cost and stock cannot be edited here (cost changes through receive_stock). A new price applies to future orders only: existing orders and invoices keep the price they were made at. Every change is written to the audit log.",
+    inputSchema: obj(
+      { sku: str("Product SKU"), name: str("New product name"), unit_price: num("New selling price per unit"), reorder_level: int("New low-stock threshold") },
+      ["sku"],
+    ),
+    readOnly: false,
+    run: svc.updateProduct,
   },
   {
     name: "list_products",
@@ -110,7 +136,7 @@ export const tools: Tool[] = [
     name: "receive_stock",
     title: "Receive stock",
     description:
-      "Record stock received from a supplier. Updates quantity and weighted-average cost, and posts Dr Inventory / Cr Cash (or Cr Accounts Payable when on_credit is true).",
+      "Record stock received from a supplier. Updates quantity and weighted-average cost, and posts Dr Inventory / Cr Cash (or Cr Accounts Payable when on_credit is true). A cash receipt is subject to the workspace cash policy: it can come back with a warning, or be refused, if it would take cash below zero. Then record owner funding or receive on credit instead.",
     inputSchema: obj(
       {
         sku: str("Product SKU"),
@@ -218,9 +244,9 @@ export const tools: Tool[] = [
   {
     name: "list_invoices",
     title: "List invoices",
-    description: "Invoices with totals, paid amounts, balances and overdue flags.",
+    description: "Invoices with totals, paid and credited amounts, balances and overdue flags.",
     inputSchema: obj({
-      status: str("Filter by status", { enum: ["open", "partial", "paid", "void"] }),
+      status: str("Filter by status (credited = settled entirely by credit notes)", { enum: ["open", "partial", "paid", "credited", "void"] }),
       client: str("Client id or exact name"),
       overdue_only: { type: "boolean", description: "Only unpaid invoices past their due date" },
     }),
@@ -230,7 +256,7 @@ export const tools: Tool[] = [
   {
     name: "get_invoice",
     title: "Get invoice",
-    description: "One invoice with its line items and payment history.",
+    description: "One invoice with its numbered line items, payment history and any credit notes issued against it.",
     inputSchema: obj({ invoice: str("Invoice id or number, e.g. INV-00001") }, ["invoice"]),
     readOnly: true,
     run: svc.getInvoice,
@@ -249,18 +275,44 @@ export const tools: Tool[] = [
   {
     name: "void_invoice",
     title: "Void invoice",
-    description: "Void an unpaid free-form invoice and reverse its entry. Not allowed for invoices with payments or invoices created from fulfilled orders.",
+    description:
+      "Void an unpaid free-form invoice and reverse its entry. Not allowed for invoices with payments or credit notes, or invoices created from fulfilled orders: use issue_credit_note for those.",
     inputSchema: obj({ invoice: str("Invoice id or number") }, ["invoice"]),
     readOnly: false,
     destructive: true,
     run: svc.voidInvoice,
+  },
+  {
+    name: "issue_credit_note",
+    title: "Issue credit note",
+    description:
+      "Correct an invoice that is fulfilled or paid, in full or in part, without editing it. Pick lines by their number on the invoice (get_invoice) and a quantity; leave items out to credit everything not yet credited. What the client still owed is reduced (Dr Sales Revenue / Cr Accounts Receivable); any excess, money they already paid, becomes a client credit (Cr Customer Credits). For stock lines you must say whether the goods came back: return_stock true puts them back into stock at their original cost (Dr Inventory / Cr Cost of Goods Sold), false credits the money only. Needs a reason. Cannot be undone.",
+    inputSchema: obj(
+      {
+        invoice: str("Invoice id or number, e.g. INV-00001"),
+        reason: str("Why the credit is being given, e.g. damaged in transit"),
+        items: {
+          type: "array",
+          minItems: 1,
+          description: "Lines to credit; omit to credit everything not yet credited",
+          items: obj({ line: int("Line number on the invoice, starting at 1"), qty: int("Units to credit") }, ["line", "qty"]),
+        },
+        return_stock: { type: "boolean", description: "Required when any credited line is a stock item: true if the goods came back into stock, false to credit the money only" },
+        date: date("Credit note date, defaults to today"),
+      },
+      ["invoice", "reason"],
+    ),
+    readOnly: false,
+    destructive: true,
+    run: svc.issueCreditNote,
   },
 
   // ---- general accounting ------------------------------------------------
   {
     name: "record_owner_investment",
     title: "Record owner investment",
-    description: "Record money put into the business by the owner (Dr Cash / Cr Owner's Equity). Use it to set opening cash.",
+    description:
+      "Record money put into the business by the owner (Dr Cash / Cr Owner's Equity). Use it to set opening cash, or to cover cash that went out before it was put in (the dashboard warns when cash is negative).",
     inputSchema: obj({ amount: num("Amount invested"), memo: str("Description"), date: date("Date, defaults to today") }, ["amount"]),
     readOnly: false,
     run: svc.recordOwnerInvestment,
@@ -268,7 +320,8 @@ export const tools: Tool[] = [
   {
     name: "record_expense",
     title: "Record expense",
-    description: "Record a business expense. Debits an expense account (default 6000 Operating Expenses) and credits Cash, or Accounts Payable when paid_from is 'payable'.",
+    description:
+      "Record a business expense. Debits an expense account (default 6000 Operating Expenses) and credits Cash, or Accounts Payable when paid_from is 'payable'. A cash expense is subject to the workspace cash policy and may come back with a warning, or be refused, if it would take cash below zero.",
     inputSchema: obj(
       {
         description: str("What the expense was for"),
@@ -285,7 +338,7 @@ export const tools: Tool[] = [
   {
     name: "pay_supplier",
     title: "Pay supplier",
-    description: "Settle money owed to suppliers (Dr Accounts Payable / Cr Cash). Cannot exceed what is owed.",
+    description: "Settle money owed to suppliers (Dr Accounts Payable / Cr Cash). Cannot exceed what is owed. Subject to the workspace cash policy if it would take cash below zero.",
     inputSchema: obj({ amount: num("Amount paid"), memo: str("Description"), date: date("Payment date, defaults to today") }, ["amount"]),
     readOnly: false,
     run: svc.paySupplier,
@@ -312,10 +365,53 @@ export const tools: Tool[] = [
   {
     name: "get_journal",
     title: "Journal entries",
-    description: "Most recent double-entry journal entries with their debit and credit lines, for audit.",
+    description:
+      "Most recent double-entry journal entries with their ids, debit and credit lines, for audit. A reversed entry shows reversed_by, and a reversing entry shows what it reverses and why.",
     inputSchema: obj({ limit: int("How many entries, default 20, max 100") }),
     readOnly: true,
     run: svc.getJournal,
+  },
+  {
+    name: "reverse_journal_entry",
+    title: "Reverse journal entry",
+    description:
+      "Correct a posted journal entry without editing it: posts a new entry that mirrors it with debits and credits swapped, linked to the original, with a required reason. The original stays visible and unchanged, and an entry can be reversed only once. Entries that belong to an invoice, payment, stock receipt, shipped order or credit note are refused (they would put the invoice or stock out of step with the books): use void_invoice or issue_credit_note for those. Get entry ids from get_journal.",
+    inputSchema: obj(
+      { entry_id: str("Journal entry id from get_journal"), reason: str("Why it is being reversed"), date: date("Date of the reversing entry, defaults to today") },
+      ["entry_id", "reason"],
+    ),
+    readOnly: false,
+    destructive: true,
+    run: svc.reverseJournalEntry,
+  },
+  {
+    name: "get_audit_log",
+    title: "Audit log",
+    description:
+      "The append-only record of edits and corrections (product and client edits, setting changes, reversals, credit notes), newest first, with what changed. Filter by entity type (product, client, settings, journal_entry, credit_note) or entity id.",
+    inputSchema: obj({
+      entity_type: str("Filter by what was changed", { enum: ["product", "client", "settings", "journal_entry", "credit_note"] }),
+      entity_id: str("Filter to one product, client, entry or credit note id"),
+      limit: int("How many entries, default 50, max 200"),
+    }),
+    readOnly: true,
+    run: svc.getAuditLog,
+  },
+  {
+    name: "get_settings",
+    title: "Workspace settings",
+    description: "The workspace settings. Currently the cash policy: block (refuse cash payments that would take cash below zero), warn (allow them but return a warning) or allow.",
+    inputSchema: obj({}),
+    readOnly: true,
+    run: (c) => svc.getSettings(c),
+  },
+  {
+    name: "update_settings",
+    title: "Change workspace settings",
+    description: "Change the cash policy: block, warn (the default) or allow. The change is written to the audit log.",
+    inputSchema: obj({ cash_policy: str("What to do with a cash payment that would take cash below zero", { enum: ["block", "warn", "allow"] }) }, ["cash_policy"]),
+    readOnly: false,
+    run: svc.updateSettings,
   },
 
   // ---- reports -----------------------------------------------------------

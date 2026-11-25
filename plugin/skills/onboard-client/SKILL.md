@@ -24,9 +24,17 @@ You cannot see the documents yourself. Only set a document to `approved` when th
 
 The client's status updates by itself: `documents_pending` until everything is in, `under_review` once every document is received or approved, and `approved` when all are approved. A rejection sends the client back to `documents_pending`.
 
+## Seeing who is stuck
+
+`list_clients` and `get_dashboard` show, for every client that is not approved, how many days they have been waiting (`days_pending`) and the `blocking_documents`: which documents are holding them up and who has to act next. `waiting_on: client` means the client still owes it (or it was rejected); `waiting_on: reviewer` means it arrived and the user needs to review it. When asked "who is stuck?", list the longest-waiting clients first with exactly those documents.
+
+## Fixing a client's details
+
+Use `update_client` to correct a name or email. It cannot change onboarding status: that only follows the documents.
+
 ## When someone asks why an order or invoice failed
 
-Call `get_client` and read the document list. Name the exact documents that are still outstanding rather than saying onboarding is incomplete.
+Call `get_client` and read `blocking_documents`. Name the exact documents that are still outstanding, and who has to act, rather than saying onboarding is incomplete.
 
 ## Wrap up
 

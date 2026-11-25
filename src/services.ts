@@ -29,9 +29,116 @@ async function runBatch(ctx: Ctx, stmts: D1PreparedStatement[], conflictMsg: str
     await ctx.db.batch(stmts);
   } catch (e) {
     const msg = String((e as Error)?.message ?? e);
+    // The cash tripwire (cash_guard, migration 0003) fired: the whole batch rolled back.
+    if (/CHECK constraint failed: ok = 1/i.test(msg))
+      throw new HttpError(409, "Blocked by the cash policy: cash changed while this was being recorded, so it would now go negative. Nothing was recorded.");
     if (/CHECK constraint|UNIQUE constraint/i.test(msg)) throw new HttpError(409, conflictMsg);
     throw e;
   }
+}
+
+// ===========================================================================
+// Audit trail and the cash policy (shared helpers)
+// ===========================================================================
+
+/** One append-only audit row. Put it in the same batch as the change it describes. */
+function auditStatement(ctx: Ctx, action: string, entityType: string, entityId: string, detail: unknown): D1PreparedStatement {
+  return ctx.db
+    .prepare("INSERT INTO audit_log (org_id, action, entity_type, entity_id, detail) VALUES (?,?,?,?,?)")
+    .bind(ctx.orgId, action, entityType, entityId, JSON.stringify(detail));
+}
+
+type CashPolicy = "block" | "warn" | "allow";
+const CASH_POLICIES: CashPolicy[] = ["block", "warn", "allow"];
+
+async function cashPolicy(ctx: Ctx): Promise<CashPolicy> {
+  const r = await first<{ cash_policy: CashPolicy }>(ctx.db.prepare("SELECT cash_policy FROM org_settings WHERE org_id=?").bind(ctx.orgId));
+  return r?.cash_policy ?? "warn";
+}
+
+/**
+ * Apply the workspace cash policy to money that is about to leave the cash account.
+ * - allow: nothing happens.
+ * - warn: the action goes ahead and the caller gets a warning to show.
+ * - block: refused up front with a friendly message. When it would be fine, the returned
+ *   `guard` statements go at the END of the same D1 batch: the database re-checks cash after the
+ *   journal entry is in and rolls the whole batch back if a concurrent request used the cash first.
+ */
+async function cashCheck(ctx: Ctx, outflow: number, alternative: string): Promise<{ guard: D1PreparedStatement[]; warnings: string[] }> {
+  const none = { guard: [] as D1PreparedStatement[], warnings: [] as string[] };
+  if (outflow <= 0) return none;
+  const policy = await cashPolicy(ctx);
+  if (policy === "allow") return none;
+  const balance = await accountNet(ctx, ACCOUNT.CASH);
+  const after = balance - outflow;
+  if (after < 0) {
+    const detail = `cash is ${m(balance)} and ${m(outflow)} would go out, leaving ${m(after)}`;
+    if (policy === "block")
+      throw new HttpError(
+        409,
+        `Blocked by the cash policy: ${detail}. Record the money coming in first with record_owner_investment, or ${alternative}. The policy can be changed with update_settings.`,
+      );
+    return { guard: [], warnings: [`Cash is negative: ${detail}. Record owner funding (record_owner_investment) or ${alternative}.`] };
+  }
+  if (policy === "block") {
+    return {
+      guard: [
+        ctx.db
+          .prepare(
+            `INSERT INTO cash_guard (ok) SELECT CASE WHEN COALESCE((SELECT SUM(debit) - SUM(credit) FROM journal_lines WHERE org_id=? AND account_code=?), 0) >= 0 THEN 1 ELSE 0 END`,
+          )
+          .bind(ctx.orgId, ACCOUNT.CASH),
+        ctx.db.prepare("DELETE FROM cash_guard"),
+      ],
+      warnings: [],
+    };
+  }
+  return none;
+}
+
+export async function getSettings(ctx: Ctx) {
+  return { cash_policy: await cashPolicy(ctx), cash_policies: CASH_POLICIES };
+}
+
+export async function updateSettings(ctx: Ctx, a: Args) {
+  const policy = optStr(a, "cash_policy");
+  if (policy === undefined) throw new HttpError(400, `Nothing to change: pass "cash_policy" (block, warn or allow)`);
+  if (!CASH_POLICIES.includes(policy as CashPolicy)) throw new HttpError(400, `"cash_policy" must be block, warn or allow`);
+  const before = await cashPolicy(ctx);
+  await ctx.db.batch([
+    ctx.db
+      .prepare(
+        `INSERT INTO org_settings (org_id, cash_policy) VALUES (?,?)
+         ON CONFLICT(org_id) DO UPDATE SET cash_policy=excluded.cash_policy, updated_at=datetime('now')`,
+      )
+      .bind(ctx.orgId, policy),
+    auditStatement(ctx, "update", "settings", ctx.orgId, { cash_policy: { from: before, to: policy } }),
+  ]);
+  return getSettings(ctx);
+}
+
+export async function getAuditLog(ctx: Ctx, a: Args) {
+  const limit = Math.min(optInt(a, "limit", 1, 50), 200);
+  const entityType = optStr(a, "entity_type");
+  const entityId = optStr(a, "entity_id");
+  const rows = await all<{ id: number; at: string; actor: string; action: string; entity_type: string; entity_id: string; detail: string }>(
+    ctx.db
+      .prepare(
+        `SELECT id, at, actor, action, entity_type, entity_id, detail FROM audit_log
+         WHERE org_id=? ${entityType ? "AND entity_type=?" : ""} ${entityId ? "AND entity_id=?" : ""} ORDER BY id DESC LIMIT ?`,
+      )
+      .bind(...[ctx.orgId, ...(entityType ? [entityType] : []), ...(entityId ? [entityId] : []), limit]),
+  );
+  return {
+    entries: rows.map((r) => ({
+      at: r.at,
+      actor: r.actor,
+      action: r.action,
+      entity_type: r.entity_type,
+      entity_id: r.entity_id,
+      detail: JSON.parse(r.detail) as unknown,
+    })),
+  };
 }
 
 // ===========================================================================
@@ -86,11 +193,34 @@ export async function authenticate(db: D1Database, token: string | null): Promis
 // Client onboarding
 // ===========================================================================
 
-interface ClientRow { id: string; name: string; email: string | null; status: string; created_at: string }
+interface ClientRow { id: string; name: string; email: string | null; status: string; created_at: string; credit_balance: number }
+const CLIENT_COLS = "id,name,email,status,created_at,credit_balance";
+
+/** Whole days since the client was added (used while they are not yet approved). */
+const daysSince = (createdAt: string) => Math.max(0, daysBetween(createdAt.slice(0, 10), today()));
+
+interface BlockingDoc { doc_type: string; status: string; waiting_on: "client" | "reviewer"; note: string | null }
+const blockingDoc = (d: { doc_type: string; status: string; note: string | null }): BlockingDoc => ({
+  doc_type: d.doc_type,
+  status: d.status,
+  // requested (or rejected, which goes back to requested) = the client owes it; received = waiting for approval
+  waiting_on: d.status === "received" ? "reviewer" : "client",
+  note: d.note,
+});
+
+/** Documents that are not yet approved, per client: the reason a client cannot be sold to. */
+async function blockingDocuments(ctx: Ctx): Promise<Map<string, BlockingDoc[]>> {
+  const rows = await all<{ client_id: string; doc_type: string; status: string; note: string | null }>(
+    ctx.db.prepare("SELECT client_id, doc_type, status, note FROM client_documents WHERE org_id=? AND status != 'approved' ORDER BY doc_type").bind(ctx.orgId),
+  );
+  const out = new Map<string, BlockingDoc[]>();
+  for (const r of rows) out.set(r.client_id, [...(out.get(r.client_id) ?? []), blockingDoc(r)]);
+  return out;
+}
 
 async function resolveClient(ctx: Ctx, ref: string): Promise<ClientRow> {
   const rows = await all<ClientRow>(
-    ctx.db.prepare("SELECT id,name,email,status,created_at FROM clients WHERE org_id=? AND (id=? OR lower(name)=lower(?))").bind(ctx.orgId, ref, ref),
+    ctx.db.prepare(`SELECT ${CLIENT_COLS} FROM clients WHERE org_id=? AND (id=? OR lower(name)=lower(?))`).bind(ctx.orgId, ref, ref),
   );
   if (rows.length === 0) throw new HttpError(404, `Client "${ref}" not found`);
   const byId = rows.find((r) => r.id === ref);
@@ -109,11 +239,22 @@ async function recomputeClientStatus(ctx: Ctx, clientId: string) {
 }
 
 async function clientView(ctx: Ctx, client: ClientRow) {
-  const documents = await all(
+  const documents = await all<{ doc_type: string; status: string; note: string | null; updated_at: string }>(
     ctx.db.prepare("SELECT doc_type, status, note, updated_at FROM client_documents WHERE client_id=? AND org_id=? ORDER BY doc_type").bind(client.id, ctx.orgId),
   );
-  const fresh = await first<ClientRow>(ctx.db.prepare("SELECT id,name,email,status,created_at FROM clients WHERE id=?").bind(client.id));
-  return { ...(fresh ?? client), documents };
+  const c = (await first<ClientRow>(ctx.db.prepare(`SELECT ${CLIENT_COLS} FROM clients WHERE id=? AND org_id=?`).bind(client.id, ctx.orgId))) ?? client;
+  const pending = c.status !== "approved";
+  return {
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    status: c.status,
+    created_at: c.created_at,
+    credit_balance: m(c.credit_balance),
+    days_pending: pending ? daysSince(c.created_at) : null,
+    blocking_documents: pending ? documents.filter((d) => d.status !== "approved").map(blockingDoc) : [],
+    documents,
+  };
 }
 
 export async function createClient(ctx: Ctx, a: Args) {
@@ -136,16 +277,58 @@ export async function getClient(ctx: Ctx, a: Args) {
 
 export async function listClients(ctx: Ctx, a: Args) {
   const status = optStr(a, "status");
-  const rows = await all(
+  const rows = await all<{ id: string; name: string; email: string | null; status: string; created_at: string; credit_balance: number; documents_outstanding: number }>(
     ctx.db
       .prepare(
-        `SELECT c.id, c.name, c.email, c.status, c.created_at,
+        `SELECT c.id, c.name, c.email, c.status, c.created_at, c.credit_balance,
                 (SELECT COUNT(*) FROM client_documents d WHERE d.client_id=c.id AND d.status!='approved') AS documents_outstanding
          FROM clients c WHERE c.org_id=? ${status ? "AND c.status=?" : ""} ORDER BY c.name`,
       )
       .bind(...(status ? [ctx.orgId, status] : [ctx.orgId])),
   );
-  return { clients: rows };
+  const blocking = await blockingDocuments(ctx);
+  return {
+    clients: rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      status: r.status,
+      created_at: r.created_at,
+      credit_balance: m(r.credit_balance),
+      documents_outstanding: r.documents_outstanding,
+      days_pending: r.status === "approved" ? null : daysSince(r.created_at),
+      blocking_documents: r.status === "approved" ? [] : (blocking.get(r.id) ?? []),
+    })),
+  };
+}
+
+/** Edit contact details. Onboarding status can only move through update_client_document. */
+export async function updateClient(ctx: Ctx, a: Args) {
+  if (a["status"] !== undefined) throw new HttpError(400, "Onboarding status cannot be edited here: it follows the documents (use update_client_document).");
+  const client = await resolveClient(ctx, reqStr(a, "client"));
+  const name = optStr(a, "name");
+  let email: string | null | undefined;
+  if (a["email"] !== undefined) {
+    const v = a["email"];
+    if (v === null) email = null;
+    else if (typeof v === "string") email = v.trim() || null; // "" clears the email
+    else throw new HttpError(400, `"email" must be a string`);
+  }
+  if (name === undefined && email === undefined) throw new HttpError(400, `Nothing to change: pass "name" and/or "email"`);
+  if (name !== undefined && name.toLowerCase() !== client.name.toLowerCase()) {
+    const dup = await first(ctx.db.prepare("SELECT id FROM clients WHERE org_id=? AND lower(name)=lower(?) AND id != ?").bind(ctx.orgId, name, client.id));
+    if (dup) throw new HttpError(409, `A client named "${name}" already exists`);
+  }
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+  if (name !== undefined && name !== client.name) changes.name = { from: client.name, to: name };
+  if (email !== undefined && email !== client.email) changes.email = { from: client.email, to: email };
+  if (Object.keys(changes).length) {
+    await ctx.db.batch([
+      ctx.db.prepare("UPDATE clients SET name=?, email=? WHERE id=? AND org_id=?").bind(name ?? client.name, email === undefined ? client.email : email, client.id, ctx.orgId),
+      auditStatement(ctx, "update", "client", client.id, changes),
+    ]);
+  }
+  return { ...(await clientView(ctx, client)), changes };
 }
 
 export async function updateClientDocument(ctx: Ctx, a: Args) {
@@ -204,7 +387,10 @@ export async function addProduct(ctx: Ctx, a: Args) {
   const sku = reqStr(a, "sku");
   const name = reqStr(a, "name");
   const unitPrice = reqMoney(a, "unit_price", true);
-  const reorder = optInt(a, "reorder_level", 0, 0);
+  // Required on purpose: 0 only flags a product once it is already out of stock, so make the caller choose.
+  if (a["reorder_level"] === undefined || a["reorder_level"] === null)
+    throw new HttpError(400, `"reorder_level" is required: the on-hand quantity at or below which this product is flagged as low stock (0 means only flag it once it is out of stock)`);
+  const reorder = reqInt(a, "reorder_level", 0);
   if (await first(ctx.db.prepare("SELECT 1 FROM products WHERE org_id=? AND sku=?").bind(ctx.orgId, sku)))
     throw new HttpError(409, `SKU "${sku}" already exists`);
   await ctx.db
@@ -212,6 +398,31 @@ export async function addProduct(ctx: Ctx, a: Args) {
     .bind(uid(), ctx.orgId, sku, name, unitPrice, optMoney(a, "unit_cost", 0), reorder)
     .run();
   return productOut(await resolveProduct(ctx, sku));
+}
+
+/** Edit name, selling price or reorder level. Cost and stock never change here, and existing orders and invoices keep the price they were made at. */
+export async function updateProduct(ctx: Ctx, a: Args) {
+  for (const k of ["unit_cost", "cost", "stock_qty", "qty"])
+    if (a[k] !== undefined) throw new HttpError(400, `"${k}" cannot be edited here: cost changes only through receive_stock, and stock only through receipts, sales and returns`);
+  const p = await resolveProduct(ctx, reqStr(a, "sku"));
+  const name = optStr(a, "name");
+  const price = a["unit_price"] === undefined || a["unit_price"] === null ? undefined : reqMoney(a, "unit_price", true);
+  const reorder = a["reorder_level"] === undefined || a["reorder_level"] === null ? undefined : reqInt(a, "reorder_level", 0);
+  if (name === undefined && price === undefined && reorder === undefined)
+    throw new HttpError(400, `Nothing to change: pass "name", "unit_price" and/or "reorder_level"`);
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+  if (name !== undefined && name !== p.name) changes.name = { from: p.name, to: name };
+  if (price !== undefined && price !== p.unit_price) changes.unit_price = { from: m(p.unit_price), to: m(price) };
+  if (reorder !== undefined && reorder !== p.reorder_level) changes.reorder_level = { from: p.reorder_level, to: reorder };
+  if (Object.keys(changes).length) {
+    await ctx.db.batch([
+      ctx.db
+        .prepare("UPDATE products SET name=?, unit_price=?, reorder_level=? WHERE id=? AND org_id=?")
+        .bind(name ?? p.name, price ?? p.unit_price, reorder ?? p.reorder_level, p.id, ctx.orgId),
+      auditStatement(ctx, "update", "product", p.id, { sku: p.sku, ...changes }),
+    ]);
+  }
+  return { ...productOut(await resolveProduct(ctx, p.sku)), changes };
 }
 
 export async function listProducts(ctx: Ctx, a: Args) {
@@ -244,6 +455,7 @@ export async function receiveStock(ctx: Ctx, a: Args) {
   const total = qty * unitCost;
   const newQty = p.stock_qty + qty;
   const newCost = Math.round((p.stock_qty * p.unit_cost + qty * unitCost) / newQty);
+  const cash = onCredit ? { guard: [], warnings: [] as string[] } : await cashCheck(ctx, total, "receive it on credit (on_credit: true)");
   await runBatch(
     ctx,
     [
@@ -256,10 +468,12 @@ export async function receiveStock(ctx: Ctx, a: Args) {
         refId: p.id,
         lines: [{ account: ACCOUNT.INVENTORY, debit: total }, { account: onCredit ? ACCOUNT.AP : ACCOUNT.CASH, credit: total }],
       }),
+      ...cash.guard,
     ],
     "Could not receive stock",
   );
-  return productOut(await resolveProduct(ctx, p.sku));
+  const out = productOut(await resolveProduct(ctx, p.sku));
+  return cash.warnings.length ? { ...out, warnings: cash.warnings } : out;
 }
 
 // ===========================================================================
@@ -351,24 +565,33 @@ export async function cancelOrder(ctx: Ctx, a: Args) {
 
 interface InvoiceRow {
   id: string; number: string; client_id: string; client_name: string; order_id: string | null;
-  issue_date: string; due_date: string; status: string; total: number; paid: number;
+  issue_date: string; due_date: string; status: string; total: number; paid: number; credited: number;
 }
 
-const INVOICE_SELECT = `SELECT i.id,i.number,i.client_id,c.name AS client_name,i.order_id,i.issue_date,i.due_date,i.status,i.total,i.paid
+const INVOICE_SELECT = `SELECT i.id,i.number,i.client_id,c.name AS client_name,i.order_id,i.issue_date,i.due_date,i.status,i.total,i.paid,i.credited
                         FROM invoices i JOIN clients c ON c.id=i.client_id`;
 
+/** What the client still owes on an invoice: total less payments less credit notes applied. */
+const invoiceBalance = (i: { status: string; total: number; paid: number; credited: number }) => (i.status === "void" ? 0 : i.total - i.paid - i.credited);
+
+// An invoice settled entirely by credit notes is stored as 'paid' (the status column cannot grow a new value
+// without rebuilding the table) but shown as 'credited'.
+const shownStatus = (i: { status: string; paid: number; credited: number }) => (i.status === "paid" && i.paid === 0 && i.credited > 0 ? "credited" : i.status);
+
 function invoiceSummary(i: InvoiceRow) {
-  const open = i.status === "open" || i.status === "partial";
+  const balance = invoiceBalance(i);
+  const open = (i.status === "open" || i.status === "partial") && balance > 0;
   return {
     invoice_id: i.id,
     number: i.number,
     client: i.client_name,
     issue_date: i.issue_date,
     due_date: i.due_date,
-    status: i.status,
+    status: shownStatus(i),
     total: m(i.total),
     paid: m(i.paid),
-    balance: m(i.status === "void" ? 0 : i.total - i.paid),
+    credited: m(i.credited),
+    balance: m(balance),
     overdue: open && i.due_date < today(),
     days_overdue: open && i.due_date < today() ? daysBetween(i.due_date, today()) : 0,
   };
@@ -382,24 +605,32 @@ async function resolveInvoice(ctx: Ctx, ref: string): Promise<InvoiceRow> {
 
 async function invoiceView(ctx: Ctx, ref: string) {
   const i = await resolveInvoice(ctx, ref);
-  const items = await all<{ description: string; qty: number; unit_price: number }>(
-    ctx.db.prepare("SELECT description, qty, unit_price FROM invoice_items WHERE invoice_id=? ORDER BY id").bind(i.id),
+  const items = await all<{ description: string; qty: number; unit_price: number; credited_qty: number }>(
+    ctx.db.prepare("SELECT description, qty, unit_price, credited_qty FROM invoice_items WHERE invoice_id=? ORDER BY id").bind(i.id),
   );
   const payments = await all<{ id: string; amount: number; method: string | null; date: string }>(
     ctx.db.prepare("SELECT id, amount, method, date FROM payments WHERE invoice_id=? ORDER BY date, rowid").bind(i.id),
   );
+  const notes = await all<{ number: string; date: string; reason: string; total: number; applied: number; client_credit: number }>(
+    ctx.db.prepare("SELECT number, date, reason, total, applied, client_credit FROM credit_notes WHERE invoice_id=? AND org_id=? ORDER BY rowid").bind(i.id, ctx.orgId),
+  );
   return {
     ...invoiceSummary(i),
     order_id: i.order_id,
-    items: items.map((x) => ({ description: x.description, qty: x.qty, unit_price: m(x.unit_price), line_total: m(x.qty * x.unit_price) })),
+    items: items.map((x, idx) => ({ line: idx + 1, description: x.description, qty: x.qty, unit_price: m(x.unit_price), line_total: m(x.qty * x.unit_price), credited_qty: x.credited_qty })),
     payments: payments.map((p) => ({ payment_id: p.id, amount: m(p.amount), method: p.method, date: p.date })),
+    credit_notes: notes.map((n) => ({ number: n.number, date: n.date, reason: n.reason, total: m(n.total), applied_to_invoice: m(n.applied), client_credit: m(n.client_credit) })),
   };
 }
 
 /** Statements that create an invoice and post Dr Accounts Receivable / Cr Sales Revenue. */
 function invoiceStatements(
   ctx: Ctx,
-  inv: { id: string; clientId: string; orderId?: string; issueDate: string; dueDate: string; items: { description: string; qty: number; unit_price: number }[] },
+  inv: {
+    id: string; clientId: string; orderId?: string; issueDate: string; dueDate: string;
+    // product_id / unit_cost are set for stock lines so a later return can restore the stock at its original cost
+    items: { description: string; qty: number; unit_price: number; product_id?: string; unit_cost?: number }[];
+  },
 ): D1PreparedStatement[] {
   const total = inv.items.reduce((s, x) => s + x.qty * x.unit_price, 0);
   return [
@@ -411,7 +642,9 @@ function invoiceStatements(
       )
       .bind(inv.id, ctx.orgId, ctx.orgId, inv.clientId, inv.orderId ?? null, inv.issueDate, inv.dueDate, total),
     ...inv.items.map((x) =>
-      ctx.db.prepare("INSERT INTO invoice_items (invoice_id, description, qty, unit_price) VALUES (?,?,?,?)").bind(inv.id, x.description, x.qty, x.unit_price),
+      ctx.db
+        .prepare("INSERT INTO invoice_items (invoice_id, description, qty, unit_price, product_id, unit_cost) VALUES (?,?,?,?,?,?)")
+        .bind(inv.id, x.description, x.qty, x.unit_price, x.product_id ?? null, x.unit_cost ?? null),
     ),
     ...journalStatements(ctx.db, ctx.orgId, {
       date: inv.issueDate,
@@ -469,7 +702,7 @@ export async function fulfillOrder(ctx: Ctx, a: Args) {
         orderId,
         issueDate,
         dueDate,
-        items: lines.map((l) => ({ description: `${l.name} (${l.sku})`, qty: l.qty, unit_price: l.unit_price })),
+        items: lines.map((l) => ({ description: `${l.name} (${l.sku})`, qty: l.qty, unit_price: l.unit_price, product_id: l.product_id, unit_cost: l.unit_cost })),
       }),
       ...journalStatements(ctx.db, ctx.orgId, {
         date: issueDate,
@@ -493,13 +726,22 @@ export async function listInvoices(ctx: Ctx, a: Args) {
   const clientRef = optStr(a, "client");
   const overdueOnly = a["overdue_only"] === true;
   const client = clientRef ? await resolveClient(ctx, clientRef) : null;
+  // 'credited' = settled entirely by credit notes (stored as 'paid' with nothing paid in)
+  const statusSql: Record<string, string> = {
+    open: "i.status='open'",
+    partial: "i.status='partial'",
+    paid: "(i.status='paid' AND NOT (i.paid=0 AND i.credited>0))",
+    credited: "(i.status='paid' AND i.paid=0 AND i.credited>0)",
+    void: "i.status='void'",
+  };
+  if (status && !statusSql[status]) throw new HttpError(400, `"status" must be one of ${Object.keys(statusSql).join(", ")}`);
   const rows = await all<InvoiceRow>(
     ctx.db
       .prepare(
-        `${INVOICE_SELECT} WHERE i.org_id=? ${status ? "AND i.status=?" : ""} ${client ? "AND i.client_id=?" : ""}
+        `${INVOICE_SELECT} WHERE i.org_id=? ${status ? "AND " + statusSql[status] : ""} ${client ? "AND i.client_id=?" : ""}
          ${overdueOnly ? "AND i.status IN ('open','partial') AND i.due_date < ?" : ""} ORDER BY i.issue_date DESC, i.number DESC LIMIT 200`,
       )
-      .bind(...[ctx.orgId, ...(status ? [status] : []), ...(client ? [client.id] : []), ...(overdueOnly ? [today()] : [])]),
+      .bind(...[ctx.orgId, ...(client ? [client.id] : []), ...(overdueOnly ? [today()] : [])]),
   );
   return { invoices: rows.map(invoiceSummary) };
 }
@@ -507,12 +749,13 @@ export async function listInvoices(ctx: Ctx, a: Args) {
 export async function voidInvoice(ctx: Ctx, a: Args) {
   const i = await resolveInvoice(ctx, reqStr(a, "invoice"));
   if (i.status === "void") throw new HttpError(409, "Invoice is already void");
-  if (i.paid > 0) throw new HttpError(409, "This invoice has payments recorded, so it cannot be voided");
-  if (i.order_id) throw new HttpError(409, "This invoice came from a fulfilled order. Voiding it would leave stock and cost of goods sold wrong, so it is not allowed. Issue a correcting invoice instead.");
+  if (i.paid > 0) throw new HttpError(409, "This invoice has payments recorded, so it cannot be voided. Issue a credit note (issue_credit_note) instead.");
+  if (i.credited > 0) throw new HttpError(409, "This invoice already has credit notes, so it cannot be voided");
+  if (i.order_id) throw new HttpError(409, "This invoice came from a fulfilled order. Voiding it would leave stock and cost of goods sold wrong, so it is not allowed. Issue a credit note (issue_credit_note) instead.");
   await runBatch(
     ctx,
     [
-      ctx.db.prepare("UPDATE invoices SET status='void' WHERE id=? AND org_id=? AND paid=0").bind(i.id, ctx.orgId),
+      ctx.db.prepare("UPDATE invoices SET status='void' WHERE id=? AND org_id=? AND paid=0 AND credited=0").bind(i.id, ctx.orgId),
       ...journalStatements(ctx.db, ctx.orgId, {
         date: today(),
         memo: `Void ${i.number}`,
@@ -531,15 +774,15 @@ export async function recordPayment(ctx: Ctx, a: Args) {
   const amount = reqMoney(a, "amount");
   const date = optDate(a, "date") ?? today();
   if (i.status === "void") throw new HttpError(409, "Invoice is void");
-  const balance = i.total - i.paid;
-  if (balance <= 0) throw new HttpError(409, `${i.number} is already fully paid`);
+  const balance = invoiceBalance(i);
+  if (balance <= 0) throw new HttpError(409, `${i.number} is already fully ${i.credited > 0 && i.paid + i.credited >= i.total ? "settled" : "paid"}`);
   if (amount > balance) throw new HttpError(409, `Payment of ${m(amount)} exceeds the balance of ${m(balance)} on ${i.number}`);
   await runBatch(
     ctx,
     [
       ctx.db.prepare("INSERT INTO payments (id, org_id, invoice_id, amount, method, date) VALUES (?,?,?,?,?,?)").bind(uid(), ctx.orgId, i.id, amount, optStr(a, "method") ?? null, date),
       ctx.db
-        .prepare("UPDATE invoices SET paid = paid + ?1, status = CASE WHEN paid + ?1 >= total THEN 'paid' ELSE 'partial' END WHERE id=?2 AND org_id=?3")
+        .prepare("UPDATE invoices SET paid = paid + ?1, status = CASE WHEN paid + ?1 + credited >= total THEN 'paid' ELSE 'partial' END WHERE id=?2 AND org_id=?3")
         .bind(amount, i.id, ctx.orgId),
       ...journalStatements(ctx.db, ctx.orgId, {
         date,
@@ -552,6 +795,155 @@ export async function recordPayment(ctx: Ctx, a: Args) {
     "Payment could not be recorded (the balance may have changed). Reload the invoice and try again.",
   );
   return invoiceView(ctx, i.id);
+}
+
+// ===========================================================================
+// Credit notes and stock returns
+// ===========================================================================
+
+async function creditNoteView(ctx: Ctx, id: string) {
+  const n = await first<{ id: string; number: string; invoice_id: string; date: string; reason: string; total: number; applied: number; client_credit: number; stock_returned: number }>(
+    ctx.db.prepare("SELECT id, number, invoice_id, date, reason, total, applied, client_credit, stock_returned FROM credit_notes WHERE id=? AND org_id=?").bind(id, ctx.orgId),
+  );
+  if (!n) throw new HttpError(404, "Credit note not found");
+  const items = await all<{ description: string; qty: number; unit_price: number; unit_cost: number | null }>(
+    ctx.db.prepare("SELECT description, qty, unit_price, unit_cost FROM credit_note_items WHERE credit_note_id=? ORDER BY id").bind(id),
+  );
+  const invoice = await invoiceView(ctx, n.invoice_id);
+  const client = await first<{ name: string; credit_balance: number }>(
+    ctx.db.prepare("SELECT c.name, c.credit_balance FROM clients c JOIN invoices i ON i.client_id=c.id WHERE i.id=? AND i.org_id=?").bind(n.invoice_id, ctx.orgId),
+  );
+  return {
+    credit_note_id: n.id,
+    number: n.number,
+    invoice: invoice.number,
+    client: client?.name,
+    date: n.date,
+    reason: n.reason,
+    total: m(n.total),
+    applied_to_invoice: m(n.applied),
+    client_credit_created: m(n.client_credit),
+    stock_returned: n.stock_returned === 1,
+    items: items.map((x) => ({ description: x.description, qty: x.qty, unit_price: m(x.unit_price), line_total: m(x.qty * x.unit_price), ...(x.unit_cost === null ? {} : { returned_at_cost: m(x.unit_cost) }) })),
+    invoice_balance_after: invoice.balance,
+    client_credit_balance: m(client?.credit_balance ?? 0),
+  };
+}
+
+/**
+ * Correct an invoice that is already fulfilled or paid, in full or in part (by invoice line and quantity).
+ * Posts Dr Sales Revenue / Cr Accounts Receivable for what the client still owed, and Cr Customer Credits for any
+ * excess (money the client has already paid). When goods come back, also Dr Inventory / Cr Cost of Goods Sold at the
+ * cost recorded when they were sold, and the product's average cost is updated. One D1 batch, so all or nothing.
+ */
+export async function issueCreditNote(ctx: Ctx, a: Args) {
+  const inv = await resolveInvoice(ctx, reqStr(a, "invoice"));
+  const reason = reqStr(a, "reason");
+  const date = optDate(a, "date") ?? today();
+  if (inv.status === "void") throw new HttpError(409, `${inv.number} is void: there is nothing to credit`);
+
+  const lines = await all<{ id: number; description: string; qty: number; unit_price: number; product_id: string | null; unit_cost: number | null; credited_qty: number }>(
+    ctx.db.prepare("SELECT id, description, qty, unit_price, product_id, unit_cost, credited_qty FROM invoice_items WHERE invoice_id=? ORDER BY id").bind(inv.id),
+  );
+
+  // which lines, and how many units of each (no "items" = everything not yet credited)
+  const wanted = new Map<number, number>(); // index into lines -> qty
+  if (a["items"] === undefined || a["items"] === null) {
+    lines.forEach((l, idx) => { if (l.qty > l.credited_qty) wanted.set(idx, l.qty - l.credited_qty); });
+  } else {
+    for (const it of reqArray(a, "items")) {
+      const n = reqInt(it, "line");
+      if (n > lines.length) throw new HttpError(400, `${inv.number} has ${lines.length} line${lines.length === 1 ? "" : "s"}: there is no line ${n}`);
+      wanted.set(n - 1, (wanted.get(n - 1) ?? 0) + reqInt(it, "qty"));
+    }
+  }
+  if (wanted.size === 0) throw new HttpError(409, `Everything on ${inv.number} has already been credited`);
+  const chosen = [...wanted].map(([idx, qty]) => {
+    const line = lines[idx];
+    const left = line.qty - line.credited_qty;
+    if (qty > left) throw new HttpError(409, `Line ${idx + 1} (${line.description}): ${left} of ${line.qty} left to credit, ${qty} requested`);
+    return { line, qty };
+  });
+  const total = chosen.reduce((s, c) => s + c.qty * c.line.unit_price, 0);
+  if (total <= 0) throw new HttpError(400, "A credit note must be for more than zero");
+
+  // goods: the caller must say whether they actually came back
+  const stockLines = chosen.filter((c) => c.line.product_id);
+  let returnStock = false;
+  if (stockLines.length) {
+    if (typeof a["return_stock"] !== "boolean")
+      throw new HttpError(400, `Some of these lines are stock items. Set "return_stock": true if the goods came back (they go back into stock at their original cost) or false to credit the money only.`);
+    returnStock = a["return_stock"];
+    const unknown = stockLines.filter((c) => c.line.unit_cost === null);
+    if (returnStock && unknown.length)
+      throw new HttpError(409, `The original cost of ${unknown.map((c) => c.line.description).join(", ")} was not recorded (it was invoiced before credit notes existed), so its stock cannot be returned automatically. Use "return_stock": false to credit the money only.`);
+  }
+
+  // split between what the client still owes (reduces the invoice) and money they already paid (becomes a client credit)
+  const applied = Math.min(total, Math.max(invoiceBalance(inv), 0));
+  const clientCredit = total - applied;
+  const returnedCost = returnStock ? stockLines.reduce((s, c) => s + c.qty * (c.line.unit_cost ?? 0), 0) : 0;
+
+  const id = uid();
+  await runBatch(
+    ctx,
+    [
+      ctx.db.prepare("UPDATE orgs SET credit_note_seq = credit_note_seq + 1 WHERE id=?").bind(ctx.orgId),
+      ctx.db
+        .prepare(
+          `INSERT INTO credit_notes (id, org_id, number, invoice_id, client_id, date, reason, total, applied, client_credit, stock_returned)
+           VALUES (?, ?, (SELECT 'CN-' || printf('%05d', credit_note_seq) FROM orgs WHERE id=?), ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(id, ctx.orgId, ctx.orgId, inv.id, inv.client_id, date, reason, total, applied, clientCredit, returnStock ? 1 : 0),
+      ...chosen.flatMap((c) => {
+        const back = returnStock && c.line.product_id !== null;
+        return [
+          ctx.db
+            .prepare("INSERT INTO credit_note_items (credit_note_id, invoice_item_id, description, qty, unit_price, product_id, unit_cost) VALUES (?,?,?,?,?,?,?)")
+            .bind(id, c.line.id, c.line.description, c.qty, c.line.unit_price, back ? c.line.product_id : null, back ? c.line.unit_cost : null),
+          // the database refuses credited_qty > qty, so two notes cannot credit the same units twice
+          ctx.db.prepare("UPDATE invoice_items SET credited_qty = credited_qty + ? WHERE id=? AND invoice_id=?").bind(c.qty, c.line.id, inv.id),
+          ...(back
+            ? [
+                // stock goes back at the original cost; the average cost is recomputed in SQL so it cannot race
+                ctx.db
+                  .prepare(
+                    `UPDATE products SET
+                       unit_cost = CASE WHEN stock_qty + ?1 > 0 THEN CAST(ROUND(1.0 * (stock_qty * unit_cost + ?1 * ?2) / (stock_qty + ?1)) AS INTEGER) ELSE unit_cost END,
+                       stock_qty = stock_qty + ?1
+                     WHERE id=?3 AND org_id=?4`,
+                  )
+                  .bind(c.qty, c.line.unit_cost, c.line.product_id, ctx.orgId),
+                ctx.db
+                  .prepare("INSERT INTO stock_movements (org_id, product_id, qty_change, reason, ref_id) VALUES (?,?,?,?,?)")
+                  .bind(ctx.orgId, c.line.product_id, c.qty, "return", id),
+              ]
+            : []),
+        ];
+      }),
+      // the database refuses paid + credited > total, so a payment that lands meanwhile makes this whole batch roll back
+      ctx.db
+        .prepare("UPDATE invoices SET credited = credited + ?1, status = CASE WHEN ?1 > 0 AND paid + credited + ?1 >= total THEN 'paid' ELSE status END WHERE id=?2 AND org_id=?3")
+        .bind(applied, inv.id, ctx.orgId),
+      ...(clientCredit > 0 ? [ctx.db.prepare("UPDATE clients SET credit_balance = credit_balance + ? WHERE id=? AND org_id=?").bind(clientCredit, inv.client_id, ctx.orgId)] : []),
+      ...journalStatements(ctx.db, ctx.orgId, {
+        date,
+        memo: `Credit note for ${inv.number}: ${reason}`,
+        refType: "credit_note",
+        refId: id,
+        lines: [
+          { account: ACCOUNT.REVENUE, debit: total },
+          { account: ACCOUNT.AR, credit: applied },
+          { account: ACCOUNT.CUSTOMER_CREDITS, credit: clientCredit },
+          { account: ACCOUNT.INVENTORY, debit: returnedCost },
+          { account: ACCOUNT.COGS, credit: returnedCost },
+        ],
+      }),
+      auditStatement(ctx, "create", "credit_note", id, { invoice: inv.number, reason, total: m(total), applied: m(applied), client_credit: m(clientCredit), stock_returned: returnStock }),
+    ],
+    "Could not issue the credit note: the invoice or its lines changed in the meantime (for example a payment or another credit note). Reload the invoice and try again.",
+  );
+  return creditNoteView(ctx, id);
 }
 
 // ===========================================================================
@@ -580,15 +972,28 @@ export async function recordExpense(ctx: Ctx, a: Args) {
   if (acct.type !== "expense") throw new HttpError(400, `Account ${code} (${acct.name}) is not an expense account`);
   const onCredit = optStr(a, "paid_from") === "payable";
   const date = optDate(a, "date") ?? today();
-  await ctx.db.batch(
-    journalStatements(ctx.db, ctx.orgId, {
-      date,
-      memo: reqStr(a, "description"),
-      refType: "expense",
-      lines: [{ account: code, debit: amount }, { account: onCredit ? ACCOUNT.AP : ACCOUNT.CASH, credit: amount }],
-    }),
+  const cash = onCredit ? { guard: [], warnings: [] as string[] } : await cashCheck(ctx, amount, "record the expense as payable (paid_from: payable)");
+  await runBatch(
+    ctx,
+    [
+      ...journalStatements(ctx.db, ctx.orgId, {
+        date,
+        memo: reqStr(a, "description"),
+        refType: "expense",
+        lines: [{ account: code, debit: amount }, { account: onCredit ? ACCOUNT.AP : ACCOUNT.CASH, credit: amount }],
+      }),
+      ...cash.guard,
+    ],
+    "Could not record the expense",
   );
-  return { recorded: true, account: `${code} ${acct.name}`, amount: m(amount), paid_from: onCredit ? "accounts payable" : "cash", date };
+  return {
+    recorded: true,
+    account: `${code} ${acct.name}`,
+    amount: m(amount),
+    paid_from: onCredit ? "accounts payable" : "cash",
+    date,
+    ...(cash.warnings.length ? { warnings: cash.warnings } : {}),
+  };
 }
 
 export async function paySupplier(ctx: Ctx, a: Args) {
@@ -597,15 +1002,21 @@ export async function paySupplier(ctx: Ctx, a: Args) {
   const bal = await accountNet(ctx, ACCOUNT.AP);
   const owed = -bal; // liabilities carry credit balances
   if (amount > owed) throw new HttpError(409, `Payment of ${m(amount)} exceeds accounts payable of ${m(Math.max(owed, 0))}`);
-  await ctx.db.batch(
-    journalStatements(ctx.db, ctx.orgId, {
-      date,
-      memo: optStr(a, "memo") ?? "Supplier payment",
-      refType: "supplier_payment",
-      lines: [{ account: ACCOUNT.AP, debit: amount }, { account: ACCOUNT.CASH, credit: amount }],
-    }),
+  const cash = await cashCheck(ctx, amount, "pay a smaller amount");
+  await runBatch(
+    ctx,
+    [
+      ...journalStatements(ctx.db, ctx.orgId, {
+        date,
+        memo: optStr(a, "memo") ?? "Supplier payment",
+        refType: "supplier_payment",
+        lines: [{ account: ACCOUNT.AP, debit: amount }, { account: ACCOUNT.CASH, credit: amount }],
+      }),
+      ...cash.guard,
+    ],
+    "Could not record the supplier payment",
   );
-  return { recorded: true, amount: m(amount), payable_remaining: m(owed - amount) };
+  return { recorded: true, amount: m(amount), payable_remaining: m(owed - amount), ...(cash.warnings.length ? { warnings: cash.warnings } : {}) };
 }
 
 export async function listAccounts(ctx: Ctx) {
@@ -623,10 +1034,82 @@ export async function addAccount(ctx: Ctx, a: Args) {
   return { code, name, type };
 }
 
+// Entries tied to a document whose own state would drift if only the ledger entry were reversed.
+const NOT_REVERSIBLE: Record<string, string> = {
+  invoice: "It belongs to an invoice: use void_invoice for an unpaid free-form invoice, or issue_credit_note for any other invoice.",
+  invoice_void: "It belongs to a voided invoice, which cannot be undone.",
+  payment: "It records a customer payment: reversing only the ledger entry would leave the invoice showing as paid. Payment reversal is not available yet.",
+  purchase: "It is a stock receipt: reversing only the ledger entry would leave the stock quantity and cost wrong.",
+  order: "It is the cost of goods sold for a shipped order: use issue_credit_note with return_stock to take goods back.",
+  credit_note: "It belongs to a credit note, which cannot be undone.",
+};
+
+/**
+ * Correct a posted entry without touching it: post a new entry that mirrors every line with debit and credit swapped,
+ * linked to the original and with a required reason. The original stays exactly as it was; reports see both.
+ */
+export async function reverseJournalEntry(ctx: Ctx, a: Args) {
+  const entryId = reqStr(a, "entry_id");
+  const reason = reqStr(a, "reason");
+  const date = optDate(a, "date") ?? today();
+  const orig = await first<{ id: string; memo: string; ref_type: string | null }>(
+    ctx.db.prepare("SELECT id, memo, ref_type FROM journal_entries WHERE id=? AND org_id=?").bind(entryId, ctx.orgId),
+  );
+  if (!orig) throw new HttpError(404, `Journal entry "${entryId}" not found`);
+  if (orig.ref_type && NOT_REVERSIBLE[orig.ref_type]) throw new HttpError(409, `This entry cannot be reversed on its own. ${NOT_REVERSIBLE[orig.ref_type]}`);
+  if (await first(ctx.db.prepare("SELECT id FROM journal_entries WHERE org_id=? AND reverses_entry_id=?").bind(ctx.orgId, orig.id)))
+    throw new HttpError(409, "This entry has already been reversed");
+
+  // reversing an entry that brought cash in takes that cash out again, so the cash policy applies
+  const cashIn = await first<{ n: number }>(
+    ctx.db.prepare("SELECT COALESCE(SUM(debit) - SUM(credit), 0) AS n FROM journal_lines WHERE entry_id=? AND org_id=? AND account_code=?").bind(orig.id, ctx.orgId, ACCOUNT.CASH),
+  );
+  const cash = await cashCheck(ctx, Math.max(cashIn?.n ?? 0, 0), "reverse it later, once the business has the cash");
+
+  const id = uid();
+  await runBatch(
+    ctx,
+    [
+      ctx.db
+        .prepare("INSERT INTO journal_entries (id, org_id, date, memo, ref_type, ref_id, reverses_entry_id, reason) VALUES (?,?,?,?,?,?,?,?)")
+        .bind(id, ctx.orgId, date, `Reversal of: ${orig.memo}`, "reversal", orig.id, orig.id, reason),
+      // copied line by line from the original with debit and credit swapped, so it balances by construction
+      ctx.db
+        .prepare("INSERT INTO journal_lines (entry_id, org_id, account_code, debit, credit) SELECT ?, org_id, account_code, credit, debit FROM journal_lines WHERE entry_id=? AND org_id=? ORDER BY id")
+        .bind(id, orig.id, ctx.orgId),
+      ...cash.guard,
+      auditStatement(ctx, "reverse", "journal_entry", orig.id, { reversal_entry_id: id, reason, date }),
+    ],
+    "This entry has already been reversed",
+  );
+  const lines = await all<{ account_code: string; name: string; debit: number; credit: number }>(
+    ctx.db
+      .prepare(
+        `SELECT l.account_code, a.name, l.debit, l.credit FROM journal_lines l
+         JOIN accounts a ON a.org_id=l.org_id AND a.code=l.account_code WHERE l.entry_id=? AND l.org_id=? ORDER BY l.id`,
+      )
+      .bind(id, ctx.orgId),
+  );
+  return {
+    reversal_entry_id: id,
+    reverses_entry_id: orig.id,
+    date,
+    reason,
+    lines: lines.map((l) => ({ account: `${l.account_code} ${l.name}`, debit: m(l.debit), credit: m(l.credit) })),
+    ...(cash.warnings.length ? { warnings: cash.warnings } : {}),
+  };
+}
+
 export async function getJournal(ctx: Ctx, a: Args) {
   const limit = Math.min(optInt(a, "limit", 1, 20), 100);
-  const entries = await all<{ id: string; date: string; memo: string; ref_type: string | null }>(
-    ctx.db.prepare("SELECT id, date, memo, ref_type FROM journal_entries WHERE org_id=? ORDER BY date DESC, created_at DESC, rowid DESC LIMIT ?").bind(ctx.orgId, limit),
+  const entries = await all<{ id: string; date: string; memo: string; ref_type: string | null; reverses_entry_id: string | null; reason: string | null; reversed_by: string | null }>(
+    ctx.db
+      .prepare(
+        `SELECT e.id, e.date, e.memo, e.ref_type, e.reverses_entry_id, e.reason,
+                (SELECT r.id FROM journal_entries r WHERE r.org_id=e.org_id AND r.reverses_entry_id=e.id) AS reversed_by
+         FROM journal_entries e WHERE e.org_id=? ORDER BY e.date DESC, e.created_at DESC, e.rowid DESC LIMIT ?`,
+      )
+      .bind(ctx.orgId, limit),
   );
   const out = [];
   for (const e of entries) {
@@ -639,9 +1122,12 @@ export async function getJournal(ctx: Ctx, a: Args) {
         .bind(e.id),
     );
     out.push({
+      entry_id: e.id,
       date: e.date,
       memo: e.memo,
       type: e.ref_type,
+      ...(e.reverses_entry_id ? { reverses_entry_id: e.reverses_entry_id, reason: e.reason } : {}),
+      ...(e.reversed_by ? { reversed_by: e.reversed_by } : {}),
       lines: lines.map((l) => ({ account: `${l.account_code} ${l.name}`, debit: m(l.debit), credit: m(l.credit) })),
     });
   }
@@ -718,7 +1204,7 @@ export async function arAging(ctx: Ctx) {
   const buckets = { current: 0, days_1_30: 0, days_31_60: 0, days_61_90: 0, days_over_90: 0 };
   const perClient = new Map<string, typeof buckets & { total: number }>();
   const invoices = rows.map((i) => {
-    const bal = i.total - i.paid;
+    const bal = invoiceBalance(i);
     const late = i.due_date < t ? daysBetween(i.due_date, t) : 0;
     const bucket: keyof typeof buckets = late === 0 ? "current" : late <= 30 ? "days_1_30" : late <= 60 ? "days_31_60" : late <= 90 ? "days_61_90" : "days_over_90";
     buckets[bucket] += bal;
@@ -749,26 +1235,47 @@ export async function dashboard(ctx: Ctx) {
   const rev = month.filter((r) => r.type === "revenue").reduce((s, r) => s + r.credit - r.debit, 0);
   const exp = month.filter((r) => r.type === "expense").reduce((s, r) => s + r.debit - r.credit, 0);
   const overdue = await first<{ n: number; amt: number | null }>(
-    ctx.db.prepare("SELECT COUNT(*) AS n, SUM(total-paid) AS amt FROM invoices WHERE org_id=? AND status IN ('open','partial') AND due_date < ?").bind(ctx.orgId, t),
+    ctx.db.prepare("SELECT COUNT(*) AS n, SUM(total-paid-credited) AS amt FROM invoices WHERE org_id=? AND status IN ('open','partial') AND due_date < ?").bind(ctx.orgId, t),
   );
   const open = await first<{ n: number; amt: number | null }>(
-    ctx.db.prepare("SELECT COUNT(*) AS n, SUM(total-paid) AS amt FROM invoices WHERE org_id=? AND status IN ('open','partial')").bind(ctx.orgId),
+    ctx.db.prepare("SELECT COUNT(*) AS n, SUM(total-paid-credited) AS amt FROM invoices WHERE org_id=? AND status IN ('open','partial')").bind(ctx.orgId),
   );
   const low = await first<{ n: number }>(ctx.db.prepare("SELECT COUNT(*) AS n FROM products WHERE org_id=? AND stock_qty <= reorder_level").bind(ctx.orgId));
+  const noLevel = await first<{ n: number }>(ctx.db.prepare("SELECT COUNT(*) AS n FROM products WHERE org_id=? AND reorder_level = 0").bind(ctx.orgId));
   const awaiting = await first<{ n: number }>(ctx.db.prepare("SELECT COUNT(*) AS n FROM orders WHERE org_id=? AND status='confirmed'").bind(ctx.orgId));
   const clients = await all<{ status: string; n: number }>(ctx.db.prepare("SELECT status, COUNT(*) AS n FROM clients WHERE org_id=? GROUP BY status").bind(ctx.orgId));
+
+  // clients stuck in onboarding, oldest first, with what is blocking each one
+  const stuck = await all<{ id: string; name: string; status: string; created_at: string }>(
+    ctx.db.prepare("SELECT id, name, status, created_at FROM clients WHERE org_id=? AND status != 'approved' ORDER BY created_at, rowid LIMIT 10").bind(ctx.orgId),
+  );
+  const blocking = stuck.length ? await blockingDocuments(ctx) : new Map<string, BlockingDoc[]>();
+
+  const cash = net(ACCOUNT.CASH);
+  const policy = await cashPolicy(ctx);
+  const warnings: string[] = [];
+  if (cash < 0)
+    warnings.push(`Cash is negative (${m(cash)}). Money went out that was never put in: record owner funding with record_owner_investment, or check what was paid in cash. Cash policy: ${policy}.`);
+  if ((noLevel?.n ?? 0) > 0)
+    warnings.push(`${noLevel?.n} product${noLevel?.n === 1 ? " has" : "s have"} no reorder level, so ${noLevel?.n === 1 ? "it only shows" : "they only show"} as low stock once out of stock. Set one with update_product.`);
+
   return {
     as_of: t,
     currency: ctx.env.CURRENCY,
-    cash: m(net(ACCOUNT.CASH)),
+    cash: m(cash),
+    cash_policy: policy,
     accounts_receivable: m(net(ACCOUNT.AR)),
     inventory_value: m(net(ACCOUNT.INVENTORY)),
     accounts_payable: m(-net(ACCOUNT.AP)),
+    client_credits: m(-net(ACCOUNT.CUSTOMER_CREDITS)),
     open_invoices: { count: open?.n ?? 0, amount: m(open?.amt ?? 0) },
     overdue_invoices: { count: overdue?.n ?? 0, amount: m(overdue?.amt ?? 0) },
     this_month: { revenue: m(rev), expenses: m(exp), net_income: m(rev - exp) },
     low_stock_products: low?.n ?? 0,
+    products_without_reorder_level: noLevel?.n ?? 0,
     orders_awaiting_fulfilment: awaiting?.n ?? 0,
     clients_by_status: Object.fromEntries(clients.map((c) => [c.status, c.n])),
+    onboarding_attention: stuck.map((c) => ({ client: c.name, client_id: c.id, status: c.status, days_pending: daysSince(c.created_at), blocking_documents: blocking.get(c.id) ?? [] })),
+    warnings,
   };
 }

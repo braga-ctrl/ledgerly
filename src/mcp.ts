@@ -9,6 +9,8 @@ const INSTRUCTIONS = [
   "Clients must be approved (all onboarding documents approved) before orders or invoices can be created.",
   "Sales flow: add_product, receive_stock, create_client, update_client_document until approved, create_order, fulfill_order (creates the invoice), record_payment.",
   "Every money movement posts a balanced journal entry automatically; use get_trial_balance, get_profit_and_loss, get_ar_aging and get_journal to inspect the books.",
+  "Posted entries are never edited: correct a fulfilled or paid invoice with issue_credit_note (say whether goods came back), and any other entry with reverse_journal_entry. Edits to products and clients are logged (get_audit_log).",
+  "Cash payments follow the workspace cash policy (get_settings): they may return warnings or be refused if cash would go negative; always tell the user about warnings from get_dashboard.",
 ].join(" ");
 
 type JsonRpcId = string | number | null;

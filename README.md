@@ -10,6 +10,8 @@ One workspace per company. Inside a workspace:
 | **Orders & inventory** | Product catalogue, stock receipts with weighted-average cost, stock reservation on orders, low-stock report. |
 | **Invoicing & payments** | Fulfilling an order ships the stock and creates the invoice in one transaction. Partial payments, overdue tracking, receivables aging. |
 | **Double-entry ledger** | Every action above posts a balanced journal entry automatically. Trial balance, profit and loss, journal. |
+| **Corrections and trust** | Posted entries are never edited. Credit notes (with stock returned at its original cost) correct shipped or paid invoices, and any suitable journal entry can be reversed with a linked, reasoned reversal. Product and client edits go to an append-only audit log. |
+| **Cash policy** | Per workspace: `block`, `warn` (default) or `allow` payments that would take cash below zero. In `block` mode the database re-checks cash inside the same transaction, so concurrent requests can't overdraw it. The dashboard warns whenever cash is negative. |
 
 ## How it fits together
 
@@ -48,7 +50,7 @@ BASE_URL=http://127.0.0.1:8787 API_KEY=lgk_... node scripts/seed-demo.mjs
 
 Open http://127.0.0.1:8787, paste the key, and you have the web app.
 
-Run the test suite (134 checks: auth, tenant isolation, onboarding gate, stock reservation, balanced books, concurrency, MCP protocol, full OAuth flow, key rotation):
+Run the test suite (259 checks: auth, tenant isolation, onboarding gate, stock reservation, balanced books, concurrency, MCP protocol, full OAuth flow, key rotation, plus the cash policy, edits and audit trail, reversing entries, credit notes and onboarding visibility):
 
 ```bash
 ADMIN_TOKEN=local-admin-token node scripts/smoke-test.mjs
@@ -72,5 +74,9 @@ scripts/        configure.mjs, seed-demo.mjs, smoke-test.mjs
 ## Known limits
 
 - **Sign-in is the workspace API key.** There are no individual user accounts, roles, or audit trail of who did what. Put your real login (SSO or accounts) behind `/authorize` before giving this to multi-user teams.
-- One currency per deployment (`CURRENCY` in `wrangler.toml`); no tax handling; no credit notes (an invoice made from an order can't be voided).
+- One currency per deployment (`CURRENCY` in `wrangler.toml`); no tax handling.
+- Invoices from fulfilled orders can't be voided: correct them with a credit note. A credit note that exceeds what the client still owed becomes a **client credit** (liability account 2100, shown on the client). There is not yet a way to apply or refund that credit.
+- Customer payments can't be reversed yet, and `reverse_journal_entry` refuses entries that belong to an invoice, payment, stock receipt, shipped order or credit note (reversing only the ledger side would put the invoice or stock out of step with the books).
+- Invoices issued before migration 0003 have no recorded cost per unit, except single-line orders where it is recovered from the cost-of-goods-sold entry. For the others a credit note can credit the money only (`return_stock: false`).
+- The audit log records edits and corrections, but not yet *who* made them (`actor` is the workspace until user accounts exist). Journal entries are protected from edits by the application, not yet by database triggers.
 - No rate limiting is built in. Add Cloudflare rate-limiting rules for `/authorize`, `/token` and `/mcp` before going public.

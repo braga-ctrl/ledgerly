@@ -34,6 +34,19 @@ curl $URL/health          # {"ok":true,"service":"ledgerly"}
 
 To change the currency, edit `CURRENCY` in `wrangler.toml` and redeploy.
 
+### Updating a deployment that already has data
+
+Migrations are applied in order and only once, so an update is: back up, apply the new migration, deploy.
+
+```bash
+npx wrangler d1 export ledgerly-db --remote --output backup-before-update.sql
+npx wrangler d1 migrations list ledgerly-db --remote      # shows what is pending
+npx wrangler d1 migrations apply ledgerly-db --remote
+npx wrangler deploy
+```
+
+Apply the migration **before** deploying: the new code reads columns and tables the migration creates.
+
 ## 2. Create a workspace for your company
 
 ```bash
@@ -52,7 +65,7 @@ Lost or leaked a key? `POST $URL/admin/orgs/<org_id>/rotate-keys` (same admin he
 BASE_URL=$URL ADMIN_TOKEN=<your admin token> node scripts/smoke-test.mjs
 ```
 
-It runs 134 checks against the live Worker. It creates three throwaway workspaces named *Northwind Trading*, *Other Co* and *Third*, so run it on a fresh deployment, not alongside real data.
+It runs 259 checks against the live Worker. It creates four throwaway workspaces named *Northwind Trading*, *Other Co*, *Third* and *Sprint One Co*, so run it on a fresh deployment, not alongside real data.
 
 ## 4. Try it in Claude as a custom connector
 
@@ -123,7 +136,7 @@ Portal > Submit new > **MCP connector**.
 | Step | What to enter |
 | --- | --- |
 | Connection | `$URL/mcp` |
-| Tools | They sync automatically. All 28 tools have a `title` and `readOnlyHint`/`destructiveHint` annotations; `void_invoice` and `cancel_order` are marked destructive. |
+| Tools | They sync automatically. All 35 tools have a `title` and `readOnlyHint`/`destructiveHint` annotations; `void_invoice`, `cancel_order`, `issue_credit_note` and `reverse_journal_entry` are marked destructive. |
 | Listing | Name, one-liner, description, categories, documentation URL (the GitHub README), privacy policy URL `$URL/privacy`, support contact, icon `plugin/assets/icon.png` |
 | Authentication | OAuth 2.0. The server supports dynamic client registration and PKCE (S256) and advertises its metadata at `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`. Choose the option for users signing in through the server's own OAuth flow, with no client ID or secret to enter. |
 | Test & launch | The reviewer account from 8a. Confirm you ran every tool (step 4 above, or MCP Inspector). |

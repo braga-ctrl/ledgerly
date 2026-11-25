@@ -371,6 +371,304 @@ eq("OAuth refresh token revoked", dead.json.error, "invalid_grant");
 KEY = NEWKEY;
 eq("new key sees the same data", (await ok(KEY, "get_dashboard")).cash, beforeCash);
 
+// ------------------------------------------------------------------ Sprint 1: ledger correctness and trust
+// Runs in its own workspace so the exact-figure checks above stay untouched.
+{
+  r = await http("POST", "/admin/orgs", { key: ADMIN, body: { name: "Sprint One Co" } });
+  const S = r.json.api_key;
+  const dashS = () => ok(S, "get_dashboard");
+  const net = async (code) => {
+    const l = (await ok(S, "get_trial_balance")).lines.find((x) => x.account.startsWith(code + " "));
+    return Math.round((l.debit - l.credit) * 100) / 100;
+  };
+  const balanced = async (label) => check(`${label}: trial balance still balances`, (await ok(S, "get_trial_balance")).balanced === true);
+  const approve = async (name, email) => {
+    await ok(S, "create_client", { name, email });
+    for (const dt of ["business_registration", "tax_id", "authorized_signatory"]) await ok(S, "update_client_document", { client: name, doc_type: dt, status: "approved" });
+  };
+  const entryByMemo = async (re, type) => (await ok(S, "get_journal", { limit: 100 })).entries.find((e) => re.test(e.memo) && (!type || e.type === type));
+  let x, d, pr;
+
+  // ---- the new tools are annotated correctly
+  const toolList = (await rpc(S, "tools/list", {})).json.result.tools;
+  const anno = Object.fromEntries(toolList.map((t) => [t.name, t.annotations]));
+  check("reverse_journal_entry and issue_credit_note are marked destructive", anno.reverse_journal_entry?.destructiveHint === true && anno.issue_credit_note?.destructiveHint === true);
+  check("get_audit_log and get_settings are read-only", anno.get_audit_log?.readOnlyHint === true && anno.get_settings?.readOnlyHint === true);
+  check("edit tools are writes, not destructive", ["update_product", "update_client", "update_settings"].every((n) => anno[n]?.readOnlyHint === false && anno[n]?.destructiveHint === false));
+
+  // ---- P0-2 reorder level is asked for
+  x = await tool(S, "add_product", { sku: "W1", name: "Widget", unit_price: 10 });
+  check("P0-2 reorder level is required when adding a product", x.isError && /reorder_level/.test(x.text), x.text);
+  x = await tool(S, "add_product", { sku: "W1", name: "Widget", unit_price: 10, reorder_level: -1 });
+  check("P0-2 negative reorder level rejected", x.isError, x.text);
+  await ok(S, "add_product", { sku: "W1", name: "Widget", unit_price: 10, reorder_level: 0 });
+  d = await dashS();
+  eq("P0-2 dashboard counts products with no reorder level", d.products_without_reorder_level, 1);
+  check("P0-2 dashboard warns about it", d.warnings.some((w) => /reorder level/.test(w)), JSON.stringify(d.warnings));
+  pr = await ok(S, "update_product", { sku: "W1", reorder_level: 20 });
+  eq("P0-2 reorder level can be set afterwards", pr.reorder_level, 20);
+  d = await dashS();
+  eq("P0-2 count drops once a level is set", d.products_without_reorder_level, 0);
+  eq("P0-2 low-stock count follows the new level (0 on hand <= 20)", d.low_stock_products, 1);
+
+  // ---- P0-1 cash policy
+  eq("P0-1 default policy is warn", (await ok(S, "get_settings")).cash_policy, "warn");
+  x = await ok(S, "receive_stock", { sku: "W1", qty: 100, unit_cost: 6 });
+  eq("P0-1 warn: the cash receipt still goes through", x.stock_qty, 100);
+  check("P0-1 warn: the caller is told, and offered the fixes", x.warnings?.length === 1 && /record_owner_investment/.test(x.warnings[0]) && /on credit/.test(x.warnings[0]), JSON.stringify(x.warnings));
+  d = await dashS();
+  eq("P0-1 cash is negative after an unfunded cash receipt", d.cash, -600);
+  check("P0-1 dashboard shows a visible negative-cash warning", d.warnings.some((w) => /negative/i.test(w)), JSON.stringify(d.warnings));
+
+  x = await tool(S, "update_settings", { cash_policy: "sometimes" });
+  check("P0-1 unknown policy rejected", x.isError, x.text);
+  x = await tool(S, "update_settings", {});
+  check("P0-1 update_settings needs something to change", x.isError, x.text);
+  eq("P0-1 policy set to block", (await ok(S, "update_settings", { cash_policy: "block" })).cash_policy, "block");
+  x = await tool(S, "receive_stock", { sku: "W1", qty: 10, unit_cost: 6 });
+  check("P0-1 block: cash receipt refused with the options named", x.isError && /cash policy/i.test(x.text) && /record_owner_investment/.test(x.text) && /on credit/.test(x.text), x.text);
+  eq("P0-1 block: nothing was recorded (stock unchanged)", (await ok(S, "list_products", { search: "W1" })).products[0].stock_qty, 100);
+  eq("P0-1 block: nothing was recorded (cash unchanged)", (await dashS()).cash, -600);
+  x = await ok(S, "receive_stock", { sku: "W1", qty: 10, unit_cost: 6, on_credit: true });
+  eq("P0-1 block: receiving on credit is still allowed", x.stock_qty, 110);
+  await ok(S, "record_owner_investment", { amount: 600, memo: "Cover opening stock" });
+  eq("P0-1 owner funding brings cash back to zero", (await dashS()).cash, 0);
+  x = await tool(S, "pay_supplier", { amount: 60 });
+  check("P0-1 block: supplier payment with no cash refused", x.isError && /cash policy/i.test(x.text), x.text);
+  x = await tool(S, "record_expense", { description: "Courier", amount: 5 });
+  check("P0-1 block: cash expense with no cash refused and payable offered", x.isError && /payable/.test(x.text), x.text);
+  await ok(S, "record_expense", { description: "Courier (unpaid)", amount: 5, paid_from: "payable" });
+  await ok(S, "record_owner_investment", { amount: 100 });
+  x = await ok(S, "record_expense", { description: "Courier", amount: 5 });
+  check("P0-1 block: an affordable cash expense goes through without warnings", x.recorded === true && !x.warnings, JSON.stringify(x));
+  eq("P0-1 cash after the expense", (await dashS()).cash, 95);
+  const burst = await Promise.all(Array.from({ length: 6 }, (_, i) => tool(S, "record_expense", { description: `Burst ${i}`, amount: 30 })));
+  const burstOk = burst.filter((b) => !b.isError).length;
+  const cashAfterBurst = (await dashS()).cash;
+  check("P0-1 block: concurrent payments cannot overdraw cash", cashAfterBurst >= 0 && burstOk <= 3 && Math.round((95 - burstOk * 30) * 100) / 100 === cashAfterBurst, `${burstOk} succeeded, cash ${cashAfterBurst}`);
+  await balanced("P0-1 after the burst");
+  await ok(S, "update_settings", { cash_policy: "allow" });
+  x = await ok(S, "record_expense", { description: "Big unplanned spend", amount: 5000 });
+  check("P0-1 allow: no warning and no block", x.recorded === true && !x.warnings, JSON.stringify(x));
+  check("P0-1 allow: cash can go negative", (await dashS()).cash < 0);
+  await ok(S, "record_owner_investment", { amount: 10000, memo: "Top up" });
+  await ok(S, "update_settings", { cash_policy: "warn" });
+  const polAudit = (await ok(S, "get_audit_log", { entity_type: "settings" })).entries;
+  check("P0-1 every policy change is in the audit log, newest first", polAudit.length === 3 && polAudit[0].detail.cash_policy.to === "warn" && polAudit[2].detail.cash_policy.from === "warn" && polAudit[2].detail.cash_policy.to === "block", JSON.stringify(polAudit));
+
+  // ---- P0-3 edit products and clients
+  await ok(S, "add_product", { sku: "E1", name: "Edit me", unit_price: 10, reorder_level: 2 });
+  await ok(S, "receive_stock", { sku: "E1", qty: 10, unit_cost: 4, on_credit: true });
+  await approve("Acme", "ap@acme.example");
+  const ordA = await ok(S, "create_order", { client: "Acme", items: [{ sku: "E1", qty: 2 }] });
+  const ordB = await ok(S, "create_order", { client: "Acme", items: [{ sku: "E1", qty: 1 }] });
+  const fA = await ok(S, "fulfill_order", { order_id: ordA.order_id });
+  eq("P0-3 invoice made at the old price", fA.invoice.total, 20);
+  pr = await ok(S, "update_product", { sku: "E1", name: "Edited", unit_price: 15 });
+  eq("P0-3 price edit reported", pr.changes.unit_price, { from: 10, to: 15 });
+  eq("P0-3 name edit applied", pr.name, "Edited");
+  eq("P0-3 existing invoice keeps its price", (await ok(S, "get_invoice", { invoice: fA.invoice.number })).total, 20);
+  eq("P0-3 existing order keeps its price", (await ok(S, "get_order", { order_id: ordB.order_id })).total, 10);
+  eq("P0-3 new order uses the new price", (await ok(S, "create_order", { client: "Acme", items: [{ sku: "E1", qty: 1 }] })).total, 15);
+  const e1Cost = (await ok(S, "list_products", { search: "E1" })).products[0];
+  eq("P0-3 cost untouched by an edit", e1Cost.unit_cost, 4);
+  x = await tool(S, "update_product", { sku: "E1", unit_cost: 1 });
+  check("P0-3 cost cannot be edited (only through receipts)", x.isError && /receive_stock/.test(x.text), x.text);
+  x = await tool(S, "update_product", { sku: "E1", stock_qty: 99 });
+  check("P0-3 stock cannot be edited", x.isError, x.text);
+  x = await tool(S, "update_product", { sku: "E1" });
+  check("P0-3 an edit with nothing in it is rejected", x.isError, x.text);
+  x = await tool(S, "update_product", { sku: "NOPE", name: "x" });
+  check("P0-3 unknown product is a clean error", x.isError && /not found/.test(x.text), x.text);
+  x = await tool(S, "update_product", { sku: "E1", unit_price: -1 });
+  check("P0-3 negative price rejected", x.isError, x.text);
+  const auditBefore = (await ok(S, "get_audit_log", { entity_type: "product" })).entries.length;
+  pr = await ok(S, "update_product", { sku: "E1", unit_price: 15 });
+  eq("P0-3 re-saving the same values changes nothing", pr.changes, {});
+  eq("P0-3 ...and writes no audit row", (await ok(S, "get_audit_log", { entity_type: "product" })).entries.length, auditBefore);
+  const prodAudit = (await ok(S, "get_audit_log", { entity_type: "product" })).entries;
+  check("P0-3 product edits are in the audit trail with before and after", prodAudit.some((e) => e.action === "update" && e.detail.sku === "E1" && e.detail.unit_price?.from === 10 && e.detail.unit_price?.to === 15 && e.detail.name?.to === "Edited"), JSON.stringify(prodAudit));
+
+  await ok(S, "create_client", { name: "Edit Me Ltd", email: "old@x.example" });
+  await ok(S, "create_client", { name: "Beta Co" });
+  x = await ok(S, "update_client", { client: "Edit Me Ltd", email: "new@x.example" });
+  eq("P0-3 client email edited", [x.email, x.changes.email], ["new@x.example", { from: "old@x.example", to: "new@x.example" }]);
+  x = await ok(S, "update_client", { client: "Edit Me Ltd", name: "Edited Ltd" });
+  eq("P0-3 client renamed", x.name, "Edited Ltd");
+  x = await tool(S, "update_client", { client: "Edited Ltd", name: "beta co" });
+  check("P0-3 rename onto an existing client refused", x.isError && /already exists/.test(x.text), x.text);
+  x = await tool(S, "update_client", { client: "Edited Ltd", status: "approved" });
+  check("P0-3 onboarding status cannot be edited by hand", x.isError && /update_client_document/.test(x.text), x.text);
+  x = await ok(S, "update_client", { client: "Edited Ltd", email: "" });
+  eq("P0-3 empty email clears it", x.email, null);
+  x = await tool(S, "update_client", { client: "Edited Ltd" });
+  check("P0-3 client edit with nothing in it rejected", x.isError, x.text);
+  const clientAudit = (await ok(S, "get_audit_log", { entity_type: "client" })).entries;
+  check("P0-3 client edits are in the audit trail", clientAudit.length === 3 && clientAudit.some((e) => e.detail.name?.from === "Edit Me Ltd" && e.detail.name?.to === "Edited Ltd"), JSON.stringify(clientAudit));
+  x = await tool(KEY2, "update_product", { sku: "E1", unit_price: 1 });
+  check("P0-3 other tenant cannot edit my product", x.isError && /not found/.test(x.text), x.text);
+  x = await tool(KEY2, "update_client", { client: "Acme", name: "Hijacked" });
+  check("P0-3 other tenant cannot edit my client", x.isError, x.text);
+  eq("P0-3 other tenant sees none of my audit log", (await ok(KEY2, "get_audit_log")).entries.length, 0);
+
+  // ---- P0-4 reversing entries
+  await ok(S, "record_owner_investment", { amount: 250, memo: "Test capital" });
+  const orig = await entryByMemo(/Test capital/);
+  check("P0-4 journal entries expose their id", typeof orig?.entry_id === "string" && orig.entry_id.length > 10, JSON.stringify(orig));
+  const cashPre = (await dashS()).cash;
+  x = await tool(S, "reverse_journal_entry", { entry_id: orig.entry_id });
+  check("P0-4 a reason is required", x.isError && /reason/.test(x.text), x.text);
+  x = await tool(S, "reverse_journal_entry", { entry_id: "no-such-entry", reason: "x" });
+  check("P0-4 unknown entry is a clean error", x.isError && /not found/.test(x.text), x.text);
+  x = await tool(KEY2, "reverse_journal_entry", { entry_id: orig.entry_id, reason: "x" });
+  check("P0-4 other tenant cannot reverse my entry", x.isError && /not found/.test(x.text), x.text);
+  const rev = await ok(S, "reverse_journal_entry", { entry_id: orig.entry_id, reason: "Entered twice" });
+  eq("P0-4 reversal mirrors the original with sides swapped", rev.lines, [{ account: "1000 Cash and Bank", debit: 0, credit: 250 }, { account: "3000 Owner's Equity", debit: 250, credit: 0 }]);
+  eq("P0-4 cash is back where it was", (await dashS()).cash, cashPre - 250);
+  const jAfter = (await ok(S, "get_journal", { limit: 100 })).entries;
+  const origAfter = jAfter.find((e) => e.entry_id === orig.entry_id);
+  const revAfter = jAfter.find((e) => e.entry_id === rev.reversal_entry_id);
+  check("P0-4 the original is still there, unchanged, and says it was reversed", origAfter && origAfter.reversed_by === rev.reversal_entry_id && JSON.stringify(origAfter.lines) === JSON.stringify(orig.lines), JSON.stringify(origAfter));
+  check("P0-4 the reversal links back and carries the reason", revAfter?.reverses_entry_id === orig.entry_id && revAfter?.reason === "Entered twice" && revAfter?.type === "reversal", JSON.stringify(revAfter));
+  x = await tool(S, "reverse_journal_entry", { entry_id: orig.entry_id, reason: "again" });
+  check("P0-4 an entry can only be reversed once", x.isError && /already/.test(x.text), x.text);
+  await ok(S, "reverse_journal_entry", { entry_id: rev.reversal_entry_id, reason: "Entered once after all" });
+  eq("P0-4 a reversal can itself be reversed (re-instating the original)", (await dashS()).cash, cashPre);
+  const invEntry = await entryByMemo(/Invoice issued/, "invoice");
+  x = await tool(S, "reverse_journal_entry", { entry_id: invEntry.entry_id, reason: "wrong" });
+  check("P0-4 an invoice's own entry is refused, with the right tool named", x.isError && /cannot be reversed on its own/.test(x.text) && /issue_credit_note/.test(x.text), x.text);
+  const buyEntry = await entryByMemo(/Stock received/, "purchase");
+  x = await tool(S, "reverse_journal_entry", { entry_id: buyEntry.entry_id, reason: "wrong" });
+  check("P0-4 a stock receipt's entry is refused", x.isError && /cannot be reversed on its own/.test(x.text), x.text);
+  const revAudit = (await ok(S, "get_audit_log", { entity_type: "journal_entry", entity_id: orig.entry_id })).entries;
+  check("P0-4 the reversal is in the audit log with its reason", revAudit.length === 1 && revAudit[0].detail.reason === "Entered twice" && revAudit[0].action === "reverse", JSON.stringify(revAudit));
+  await balanced("P0-4");
+  // reversing money that came in takes it out again, so the cash policy applies
+  await ok(S, "update_settings", { cash_policy: "block" });
+  await ok(S, "record_owner_investment", { amount: 70, memo: "Small capital" });
+  const small = await entryByMemo(/Small capital/);
+  const cashNow = (await dashS()).cash;
+  await ok(S, "record_expense", { description: "Drain cash", amount: Math.round((cashNow - 30) * 100) / 100 }); // leaves 30: enough to keep cash positive, not enough to take 70 back out
+  x = await tool(S, "reverse_journal_entry", { entry_id: small.entry_id, reason: "mistake" });
+  check("P0-4 block: reversing money in is refused when the cash is gone", x.isError && /cash policy/i.test(x.text), x.text);
+  await ok(S, "update_settings", { cash_policy: "warn" });
+  x = await ok(S, "reverse_journal_entry", { entry_id: small.entry_id, reason: "mistake" });
+  check("P0-4 warn: the same reversal goes through with a warning", x.warnings?.length === 1 && /negative/i.test(x.warnings[0]), JSON.stringify(x));
+  await ok(S, "record_owner_investment", { amount: 1000, memo: "Restore cash" });
+  await balanced("P0-4 after cash-policy reversals");
+
+  // ---- P0-5 credit notes and stock returns
+  await ok(S, "add_product", { sku: "C1", name: "Gadget", unit_price: 50, reorder_level: 5 });
+  await ok(S, "receive_stock", { sku: "C1", qty: 20, unit_cost: 30, on_credit: true });
+  const o1 = await ok(S, "create_order", { client: "Acme", items: [{ sku: "C1", qty: 10 }] });
+  const f1 = await ok(S, "fulfill_order", { order_id: o1.order_id });
+  const INV1 = f1.invoice.number;
+  eq("P0-5 invoice total", f1.invoice.total, 500);
+  const stockOf = async (sku) => (await ok(S, "list_products", { search: sku })).products.find((p) => p.sku === sku);
+
+  x = await tool(S, "issue_credit_note", { invoice: INV1, reason: "damaged" });
+  check("P0-5 for stock lines you must say whether goods came back", x.isError && /return_stock/.test(x.text), x.text);
+  x = await tool(S, "issue_credit_note", { invoice: INV1, items: [{ line: 1, qty: 3 }], return_stock: true });
+  check("P0-5 a reason is required", x.isError && /reason/.test(x.text), x.text);
+  x = await tool(S, "issue_credit_note", { invoice: INV1, reason: "x", items: [{ line: 1, qty: 11 }], return_stock: true });
+  check("P0-5 cannot credit more than was sold", x.isError && /left to credit/.test(x.text), x.text);
+  x = await tool(S, "issue_credit_note", { invoice: INV1, reason: "x", items: [{ line: 2, qty: 1 }], return_stock: true });
+  check("P0-5 unknown line rejected", x.isError && /no line 2/.test(x.text), x.text);
+  x = await tool(KEY2, "issue_credit_note", { invoice: INV1, reason: "x", return_stock: true });
+  check("P0-5 other tenant cannot credit my invoice", x.isError && /not found/.test(x.text), x.text);
+  eq("P0-5 failed attempts changed nothing (stock)", (await stockOf("C1")).stock_qty, 10);
+
+  // partial credit with the goods back
+  const cn1 = await ok(S, "issue_credit_note", { invoice: INV1, reason: "3 damaged in transit", items: [{ line: 1, qty: 3 }], return_stock: true });
+  eq("P0-5 first credit note number", cn1.number, "CN-00001");
+  eq("P0-5 credit note total", cn1.total, 150);
+  eq("P0-5 it reduced what the client owes", [cn1.applied_to_invoice, cn1.client_credit_created, cn1.invoice_balance_after], [150, 0, 350]);
+  eq("P0-5 goods went back into stock", [(await stockOf("C1")).stock_qty, (await stockOf("C1")).unit_cost], [13, 30]);
+  let iv = await ok(S, "get_invoice", { invoice: INV1 });
+  eq("P0-5 invoice shows the credit", [iv.credited, iv.balance, iv.status, iv.items[0].credited_qty, iv.credit_notes.length], [150, 350, "open", 3, 1]);
+  const cnEntry = await entryByMemo(/Credit note for/, "credit_note");
+  check("P0-5 the posting references the original invoice", cnEntry.memo.includes(INV1), cnEntry.memo);
+  eq("P0-5 the posting: revenue and receivable back, stock back at cost", cnEntry.lines.map((l) => [l.account, l.debit, l.credit]).sort(), [["1100 Accounts Receivable", 0, 150], ["1200 Inventory", 90, 0], ["4000 Sales Revenue", 150, 0], ["5000 Cost of Goods Sold", 0, 90]].sort());
+  await balanced("P0-5 first credit note");
+
+  // stock returns at the ORIGINAL cost even when the average has moved
+  x = await ok(S, "receive_stock", { sku: "C1", qty: 7, unit_cost: 44, on_credit: true });
+  eq("P0-5 average cost moved", [x.stock_qty, x.unit_cost], [20, 34.9]);
+  const cn2 = await ok(S, "issue_credit_note", { invoice: INV1, reason: "5 more returned", items: [{ line: 1, qty: 5 }], return_stock: true });
+  eq("P0-5 returned at the original cost", cn2.items[0].returned_at_cost, 30);
+  eq("P0-5 average cost blends the returned units in", [(await stockOf("C1")).stock_qty, (await stockOf("C1")).unit_cost], [25, 33.92]);
+  eq("P0-5 balance after two credit notes", cn2.invoice_balance_after, 100);
+
+  // paid in full, then credit the rest: the excess becomes a client credit
+  iv = await ok(S, "record_payment", { invoice: INV1, amount: 100, method: "bank transfer" });
+  eq("P0-5 invoice settled by payment plus credits", [iv.status, iv.balance], ["paid", 0]);
+  x = await tool(S, "record_payment", { invoice: INV1, amount: 1 });
+  check("P0-5 nothing more can be paid on it", x.isError, x.text);
+  const cn3 = await ok(S, "issue_credit_note", { invoice: INV1, reason: "2 refunded, not returned", items: [{ line: 1, qty: 2 }], return_stock: false });
+  eq("P0-5 credit on a settled invoice becomes a client credit", [cn3.applied_to_invoice, cn3.client_credit_created, cn3.client_credit_balance, cn3.stock_returned], [0, 100, 100, false]);
+  eq("P0-5 stock untouched when goods did not come back", (await stockOf("C1")).stock_qty, 25);
+  eq("P0-5 dashboard shows the client credit", (await dashS()).client_credits, 100);
+  eq("P0-5 client record shows the credit", (await ok(S, "get_client", { client: "Acme" })).credit_balance, 100);
+  const cn3Entry = await entryByMemo(/2 refunded/, "credit_note");
+  eq("P0-5 the excess posts to Customer Credits", cn3Entry.lines.map((l) => [l.account, l.debit, l.credit]).sort(), [["2100 Customer Credits", 0, 100], ["4000 Sales Revenue", 100, 0]].sort());
+  x = await tool(S, "issue_credit_note", { invoice: INV1, reason: "again", return_stock: true });
+  check("P0-5 an invoice cannot be credited past what was sold", x.isError && /already been credited/.test(x.text), x.text);
+  await balanced("P0-5 client credit");
+
+  // an unpaid invoice credited in full
+  const o2 = await ok(S, "create_order", { client: "Acme", items: [{ sku: "C1", qty: 4 }] });
+  const INV2 = (await ok(S, "fulfill_order", { order_id: o2.order_id })).invoice.number;
+  const cn4 = await ok(S, "issue_credit_note", { invoice: INV2, reason: "order cancelled after shipping", return_stock: true });
+  eq("P0-5 full credit with items left out", [cn4.total, cn4.applied_to_invoice, cn4.invoice_balance_after], [200, 200, 0]);
+  eq("P0-5 stock came back", (await stockOf("C1")).stock_qty, 25);
+  iv = await ok(S, "get_invoice", { invoice: INV2 });
+  eq("P0-5 fully credited invoice shows as credited", [iv.status, iv.balance, iv.paid, iv.credited], ["credited", 0, 0, 200]);
+  eq("P0-5 and can be listed that way", (await ok(S, "list_invoices", { status: "credited" })).invoices.map((i) => i.number), [INV2]);
+  check("P0-5 ...and not as paid", !(await ok(S, "list_invoices", { status: "paid" })).invoices.some((i) => i.number === INV2));
+  x = await tool(S, "record_payment", { invoice: INV2, amount: 1 });
+  check("P0-5 a credited invoice cannot take payment", x.isError, x.text);
+  x = await tool(S, "void_invoice", { invoice: INV2 });
+  check("P0-5 a credited invoice cannot be voided", x.isError, x.text);
+  check("P0-5 receivables aging leaves it out", !(await ok(S, "get_ar_aging")).invoices.some((i) => i.number === INV2));
+
+  // services invoice: no goods, so no return_stock needed
+  const svc = await ok(S, "create_invoice", { client: "Acme", items: [{ description: "Consulting", qty: 2, unit_price: 300 }] });
+  const cn5 = await ok(S, "issue_credit_note", { invoice: svc.number, reason: "one hour waived", items: [{ line: 1, qty: 1 }] });
+  eq("P0-5 partial credit on a services invoice", [cn5.total, cn5.invoice_balance_after, cn5.stock_returned], [300, 300, false]);
+
+  // the books tie to the sub-ledgers
+  const allInv = (await ok(S, "list_invoices", {})).invoices;
+  eq("P0-5 receivables account equals the sum of invoice balances", await net("1100"), Math.round(allInv.reduce((s, i) => s + i.balance, 0) * 100) / 100);
+  const allClients = (await ok(S, "list_clients")).clients;
+  eq("P0-5 customer credits account equals the sum of client credits", -(await net("2100")), Math.round(allClients.reduce((s, c) => s + c.credit_balance, 0) * 100) / 100);
+  const allProducts = (await ok(S, "list_products")).products;
+  eq("P0-5 inventory account equals the value of stock on hand", await net("1200"), Math.round(allProducts.reduce((s, p) => s + p.stock_value, 0) * 100) / 100);
+  await balanced("P0-5 final");
+  check("P0-5 credit notes are in the audit log", (await ok(S, "get_audit_log", { entity_type: "credit_note" })).entries.length === 5);
+
+  // ---- P0-6 onboarding visibility
+  await ok(S, "create_client", { name: "Slow Co" });
+  let lc = (await ok(S, "list_clients")).clients.find((c) => c.name === "Slow Co");
+  eq("P0-6 new client: days pending and all three documents blocking", [lc.days_pending, lc.blocking_documents.map((b) => b.doc_type)], [0, ["authorized_signatory", "business_registration", "tax_id"]]);
+  check("P0-6 each blocking document says who must act", lc.blocking_documents.every((b) => b.waiting_on === "client"));
+  await ok(S, "update_client_document", { client: "Slow Co", doc_type: "tax_id", status: "received" });
+  lc = (await ok(S, "list_clients")).clients.find((c) => c.name === "Slow Co");
+  eq("P0-6 a received document now waits on a reviewer", lc.blocking_documents.find((b) => b.doc_type === "tax_id").waiting_on, "reviewer");
+  await ok(S, "update_client_document", { client: "Slow Co", doc_type: "business_registration", status: "approved" });
+  eq("P0-6 an approved document stops blocking", (await ok(S, "get_client", { client: "Slow Co" })).blocking_documents.map((b) => b.doc_type), ["authorized_signatory", "tax_id"]);
+  d = await dashS();
+  const att = d.onboarding_attention.find((c) => c.client === "Slow Co");
+  check("P0-6 dashboard lists the stuck client with what blocks it", att && att.days_pending === 0 && att.blocking_documents.length === 2, JSON.stringify(att));
+  check("P0-6 approved clients are not listed", !d.onboarding_attention.some((c) => c.client === "Acme"));
+  await ok(S, "update_client_document", { client: "Slow Co", doc_type: "tax_id", status: "approved" });
+  await ok(S, "update_client_document", { client: "Slow Co", doc_type: "authorized_signatory", status: "approved" });
+  lc = (await ok(S, "list_clients")).clients.find((c) => c.name === "Slow Co");
+  eq("P0-6 once approved nothing is pending", [lc.status, lc.days_pending, lc.blocking_documents], ["approved", null, []]);
+  check("P0-6 and the dashboard drops it", !(await dashS()).onboarding_attention.some((c) => c.client === "Slow Co"));
+  x = await tool(S, "create_order", { client: "Beta Co", items: [{ sku: "C1", qty: 1 }] });
+  check("onboarding gate still holds for a client with documents outstanding", x.isError && /approved/i.test(x.text), x.text);
+}
+
 // ------------------------------------------------------------------ report
 console.log(`\n${passed} checks passed, ${failures.length} failed`);
 if (failures.length) {
